@@ -1,0 +1,197 @@
+================================================================================
+  Task 1 — ACO Solver Improvements
+  Warehouse Optimisation Playground
+================================================================================
+
+Overview
+--------
+The ant_colony() function in tsp.py was extended with three improvements over
+the original basic port.  Each improvement can be toggled independently via
+keyword arguments so their individual contributions can be measured.
+
+New parameters added to ant_colony():
+
+  symmetric_deposit : bool = True
+      When True, depositing pheromone on edge i→j also deposits on j→i.
+
+  elitism : bool = True
+      When True, extra pheromone is laid along the globally best tour found
+      so far at the end of every iteration.
+
+  per_ant_2opt : bool = True
+      When True, each ant's stochastically constructed tour is locally
+      improved with two_opt_improve() before its cost is used to compute
+      the pheromone deposit.
+
+
+--------------------------------------------------------------------------------
+  Improvement 1a — Symmetric Pheromone Deposit
+--------------------------------------------------------------------------------
+
+Change
+  In the per-ant deposit loop, when an ant traverses edge i → j, the reverse
+  edge j → i is now also reinforced by the same deposit amount:
+
+    pheromone[route[k],     route[k + 1]] += deposit   # was already here
+    pheromone[route[k + 1], route[k]    ] += deposit   # added
+
+Rationale
+  On a mostly bidirectional graph, an ant that found a good edge A→B has also
+  implicitly found a good edge B→A.  Reinforcing both directions propagates
+  that signal to future ants regardless of which direction they traverse the
+  edge, leading to faster convergence.
+
+  On the warehouse graph 5 of 10 aisles are one-way (directed).  Those edges
+  already have asymmetric distances baked into the D matrix (the cost of going
+  the wrong way routes through the corridor), so the directional penalty is
+  preserved even when pheromone is symmetric.
+
+Result on 200 pickruns (seed=42)
+  ACO baseline     174.2 m    (no improvements active)
+  ACO +sym only    173.9 m    +0.2% shorter than baseline
+  Runtime impact:  none (~20s both ways)
+
+Conclusion
+  Small but free gain.  Net positive on this mostly-bidirectional graph.
+  A more strongly directed graph might prefer asymmetric deposit.
+
+
+--------------------------------------------------------------------------------
+  Improvement 1b — Elitism
+--------------------------------------------------------------------------------
+
+Change
+  After the per-ant pheromone evaporation and deposit loop, an extra deposit
+  proportional to 1/best_cost is added along every edge of the globally best
+  tour found so far:
+
+    elite_deposit = 1.0 / best_cost
+    u = [0] + best_route_idx          # prepend start node index
+    for k in range(len(u) - 1):
+        pheromone[u[k], u[k + 1]] += elite_deposit
+
+Rationale
+  Standard ACO reinforces every ant's tour proportional to its quality.  This
+  means a mediocre tour visited by many ants can accumulate more pheromone than
+  the single best tour.  The elite deposit corrects this by continuously
+  stamping the best-known solution, pulling the colony's probability distribution
+  toward that region of the search space.
+
+Result on 200 pickruns (seed=42)
+  ACO baseline      174.2 m
+  ACO +elite only   173.6 m    +0.3% shorter than baseline
+  Runtime impact:   none (one extra O(n) loop per iteration)
+
+Conclusion
+  Best cost/benefit ratio of the three improvements — same quality gain as
+  per-ant 2-opt at zero extra runtime cost.  Recommended as a default-on
+  improvement for any ACO deployment.
+
+
+--------------------------------------------------------------------------------
+  Improvement 1c — Per-Ant 2-Opt
+--------------------------------------------------------------------------------
+
+Change
+  After each ant finishes constructing its tour stochastically, the tour is
+  passed through two_opt_improve() before the cost is computed for pheromone
+  deposit.  The improved route replaces the constructed route for that ant:
+
+    ant_tiles_list = [nodes[i] for i in route[1:]]
+    improved_tiles, _ = two_opt_improve(ant_tiles_list, start, graph)
+    route = [0] + [tile_to_idx[t] for t in improved_tiles]
+    cost  = sum(D[route[k], route[k + 1]] for k in range(len(route) - 1))
+
+  A tile_to_idx reverse lookup dict is built once before the iteration loop so
+  the index conversion is O(1) per tile rather than O(n).
+
+Rationale
+  Stochastic construction occasionally produces tours with obvious crossing
+  edges that a single 2-opt pass would fix immediately.  By locally improving
+  each ant's tour before depositing pheromone, the colony's reinforcement
+  signal reflects post-improvement quality rather than raw construction
+  quality.  This helps the colony converge on genuinely good edge sets rather
+  than edges that happen to appear in mediocre-but-consistent tours.
+
+Result on 200 pickruns (seed=42)
+  ACO baseline     174.2 m
+  ACO +2opt only   173.7 m    +0.3% shorter than baseline
+  Runtime impact:  +5–6 seconds (~30% slower: 26s vs 20s)
+
+Conclusion
+  Same quality gain as elitism but at a meaningful runtime cost.  On this
+  dataset (avg 4.8 items/run, small segments) 2-opt convergences quickly so
+  the overhead is moderate.  On instances with larger pick lists (20+ items)
+  the per-ant 2-opt cost would grow quadratically while the quality gain would
+  likely be larger, potentially improving the trade-off.
+
+
+--------------------------------------------------------------------------------
+  Full Comparison Table
+  (200 pickruns, seed=42, n_ants=15, n_iterations=50)
+--------------------------------------------------------------------------------
+
+Variant                   Avg dist/run   vs 2-opt   vs baseline    Time
+────────────────────────  ────────────  ─────────  ────────────  ──────
+NN  (reference)               181.1 m       base             —    0.2s
+2-opt  (reference)            174.8 m       base             —    0.2s
+ACO baseline                  174.2 m      +0.4%             —   20.6s
+ACO +sym only                 173.9 m      +0.6%         +0.2%   20.4s
+ACO +elite only               173.6 m      +0.7%         +0.3%   20.6s
+ACO +2opt only                173.7 m      +0.7%         +0.3%   26.0s
+ACO +sym+elite (no 2opt)      173.7 m      +0.6%         +0.3%   20.2s
+ACO all three                 173.7 m      +0.6%         +0.3%   27.7s
+
+Notes
+  • "vs 2-opt"    — positive = shorter than 2-opt reference (better)
+  • "vs baseline" — positive = shorter than ACO with no improvements (better)
+  • Absolute differences are small because this synthetic dataset has short
+    pick lists (avg 4.8 items/run); on longer runs the relative gains would
+    be larger.
+
+
+--------------------------------------------------------------------------------
+  Interaction Effects
+--------------------------------------------------------------------------------
+
+The improvements are largely complementary but exhibit diminishing returns
+when combined:
+
+  Elitism alone            −0.6 m  (173.6 m)
+  Symmetric alone          −0.3 m  (173.9 m)
+  2-opt alone              −0.5 m  (173.7 m)
+  All three combined       −0.5 m  (173.7 m)  ← not additive
+
+The total gain from all three is no larger than elitism alone.  This is
+expected: once the colony has been steered to the 173.6–173.7 m region
+by any one improvement, the other two have little uncaptured territory to
+find within the same iteration budget (50 iterations × 15 ants).
+
+Increasing n_iterations or n_ants would let the combined improvements
+separate more clearly from single-improvement variants.
+
+
+--------------------------------------------------------------------------------
+  Code Locations
+--------------------------------------------------------------------------------
+
+  tsp.py
+    ant_colony()         line 463   — full implementation with all three flags
+    two_opt_improve()    line 108   — used by per-ant 2-opt (unchanged)
+
+  compare_aco.py         — standalone script that produced the table above
+                           run with: python compare_aco.py
+
+
+--------------------------------------------------------------------------------
+  Recommended Default Configuration
+--------------------------------------------------------------------------------
+
+  symmetric_deposit = True   — free gain, no downside on this graph
+  elitism           = True   — best cost/benefit; zero runtime overhead
+  per_ant_2opt      = True   — worthwhile on larger pick lists; acceptable
+                               overhead (~30%) on this dataset size
+
+All three are enabled by default in the current ant_colony() signature.
+
+================================================================================
