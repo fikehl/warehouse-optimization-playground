@@ -27,7 +27,7 @@ import numpy as np
 import simpy
 
 from graph import WarehouseGraph, DEPOT
-from tsp import RouteResult, SPEED_M_S, PICK_TIME_S
+from tsp import RouteResult, SPEED_M_S, PICK_TIME_S, _apply_solver
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +80,8 @@ def run_des(
     fatigue_pct_per_100_picks: float = 0.0,
     machine_profile: MachineProfile | None = None,
     reroute_on_wait_s: float = 0.0,
+    reroute_solver: str = "nn",
+    coordinated_dispatch: bool = False,
 ) -> dict:
     """Simulate all pickruns and return aggregate statistics.
 
@@ -115,11 +117,23 @@ def run_des(
         with ``MachineProfile(...)``.  ``None`` falls back to the module-level
         ``SPEED_M_S`` / ``PICK_TIME_S`` constants (equivalent to ``HUMAN``).
     reroute_on_wait_s : float
-        When > 0 and a picker has been queued for a one-way aisle for longer
-        than this many seconds, they give up waiting and defer all tiles in
-        that aisle to the end of their route, processing other aisles first.
-        Set to e.g. 30.0 to explore whether opportunistic rerouting reduces
-        makespan.  Experiment: does rerouting help more with 2 pickers or 5?
+        When > 0 and a picker arrives at a one-way aisle that already has
+        waiters, they re-optimise their remaining non-blocked tiles with
+        ``reroute_solver`` and push the blocked aisle to the end of their
+        route.  Set to e.g. 30.0 to explore whether opportunistic rerouting
+        reduces makespan.
+    reroute_solver : str
+        TSP solver used to re-order the un-blocked tiles when a reroute
+        fires (``reroute_on_wait_s > 0``).  Any solver accepted by
+        ``tsp._apply_solver`` is valid; defaults to ``"nn"``.  Ignored
+        when ``reroute_on_wait_s == 0``.
+    coordinated_dispatch : bool
+        When True a shared work-pool replaces per-pickrun pre-assigned
+        routes.  A central dispatcher process monitors aisle queues every
+        10 s and pushes tiles from congested aisles to the back of the
+        pool.  Exactly ``n_pickers`` workers draw from the pool until it
+        is empty.  Incompatible with per-pickrun release times (all tiles
+        start at t=0).
 
     Returns
     -------
@@ -154,7 +168,8 @@ def run_des(
     aisle_wait:    dict[int, list[float]] = {x: [] for x in oneway_xs}
     pickrun_times: list[float] = []
     restock_waits: list[float] = []
-    reroute_count: list[int]   = [0]   # mutable counter shared across closures
+    reroute_count:   list[int]   = [0]   # mutable counter shared across closures
+    dispatch_finish: list[float] = []   # absolute finish times for coordinated pickers
 
     # --- Replenisher worker processes ---
     def _replenisher_worker():
@@ -210,26 +225,46 @@ def run_des(
                             picks_done += 1
                         prev = t
                     i = j
-                elif reroute_on_wait_s > 0 and len(aisle_res[x].queue) > 0:
-                    # Rerouting enabled and aisle is queued — defer this aisle's
-                    # tiles to the end of the route and continue with other aisles.
-                    deferred = [t for t in tiles[i:] if graph.tile_x(t) == x]
-                    rest     = [t for t in tiles[i:] if graph.tile_x(t) != x]
-                    tiles[i:] = rest + deferred
-                    reroute_count[0] += 1
-                    # Do NOT advance i — re-evaluate tiles[i] (now a different tile)
                 else:
+                    # Narrow-capable machine: queue for the one-way aisle.
+                    # When reroute_on_wait_s > 0 the picker reneges if it has
+                    # waited longer than the threshold AND has other (non-blocked)
+                    # tiles it could pick meanwhile.  On renege it re-solves the
+                    # un-blocked tiles with reroute_solver and defers this aisle to
+                    # the end of the route.  This models genuine wait-then-give-up,
+                    # so the threshold value actually governs behaviour.
+                    rest_picks = [t for t in tiles[i:]
+                                  if graph.tile_x(t) != x and t != graph.end_tile]
+                    use_reroute = reroute_on_wait_s > 0 and len(rest_picks) > 0
                     t_req = env.now
                     with aisle_res[x].request() as req:
-                        yield req
-                        aisle_wait[x].append(env.now - t_req)
-                        for t in seg:
-                            yield env.timeout(graph.distance(prev, t) / eff_speed)
-                            if t != graph.end_tile:
-                                yield from _pick_at(t)
-                                picks_done += 1
-                            prev = t
-                    i = j
+                        if use_reroute:
+                            got = req in (yield req | env.timeout(reroute_on_wait_s))
+                        else:
+                            yield req
+                            got = True
+
+                        if got:
+                            aisle_wait[x].append(env.now - t_req)
+                            for t in seg:
+                                yield env.timeout(graph.distance(prev, t) / eff_speed)
+                                if t != graph.end_tile:
+                                    yield from _pick_at(t)
+                                    picks_done += 1
+                                prev = t
+                            i = j
+                        else:
+                            # Waited reroute_on_wait_s without acquiring the aisle:
+                            # give up, re-solve the un-blocked tiles, defer this
+                            # aisle.  i is left unchanged so the reordered tiles[i]
+                            # is re-evaluated on the next loop iteration.
+                            deferred = [t for t in tiles[i:] if graph.tile_x(t) == x]
+                            end_part = ([graph.end_tile]
+                                        if graph.end_tile in tiles[i:] else [])
+                            solved, _ = _apply_solver(reroute_solver, rest_picks,
+                                                      prev, graph)
+                            tiles[i:] = solved + deferred + end_part
+                            reroute_count[0] += 1
             else:
                 yield env.timeout(graph.distance(prev, tile) / eff_speed)
                 if tile != graph.end_tile:
@@ -252,12 +287,89 @@ def run_des(
             restock_waits.append(env.now - t_req)
         yield env.timeout(PICK_TIME_S)
 
-    for rr in route_results:
-        env.process(picker_process(rr))
+    # --- Coordinated dispatch (2c) — shared work-pool + central dispatcher ---
+    if coordinated_dispatch:
+        work_pool: list[str] = [
+            t for rr in route_results
+            for t in rr.route_tiles
+            if t not in (graph.start_tile, graph.end_tile)
+        ]
+
+        def _coordinated_picker(_picker_id: int):
+            cur        = graph.start_tile
+            t_start    = env.now
+            picks_done = 0
+            while work_pool:
+                idx  = min(range(len(work_pool)),
+                           key=lambda i: graph.distance(cur, work_pool[i]))
+                tile = work_pool.pop(idx)
+                x    = graph.tile_x(tile)
+
+                eff_speed = mp.speed_m_s
+                if fatigue_pct_per_100_picks > 0.0:
+                    reduction = (picks_done / 100.0) * (fatigue_pct_per_100_picks / 100.0)
+                    eff_speed = mp.speed_m_s * max(0.1, 1.0 - reduction)
+
+                if x is not None and x in aisle_res:
+                    # Grab every available tile in this aisle at once so we
+                    # only request the resource once per aisle visit.
+                    same = [t for t in work_pool if graph.tile_x(t) == x]
+                    for t in same:
+                        work_pool.remove(t)
+                    seg = sorted([tile] + same,
+                                 key=lambda t: int(t.split("_")[1]))
+
+                    if not mp.narrow_ok:
+                        for t in seg:
+                            d = graph.distance(cur, t) * mp.detour_factor
+                            yield env.timeout(d / eff_speed)
+                            yield from _pick_at(t)
+                            picks_done += 1
+                            cur = t
+                    else:
+                        t_req = env.now
+                        with aisle_res[x].request() as req:
+                            yield req
+                            aisle_wait[x].append(env.now - t_req)
+                            for t in seg:
+                                yield env.timeout(graph.distance(cur, t) / eff_speed)
+                                yield from _pick_at(t)
+                                picks_done += 1
+                                cur = t
+                else:
+                    yield env.timeout(graph.distance(cur, tile) / eff_speed)
+                    yield from _pick_at(tile)
+                    picks_done += 1
+                    cur = tile
+
+            yield env.timeout(graph.distance(cur, graph.end_tile) / eff_speed)
+            dispatch_finish.append(env.now)
+            pickrun_times.append(env.now - t_start)
+
+        def _dispatcher():
+            """Periodically deprioritise tiles in congested aisles."""
+            while work_pool:
+                yield env.timeout(10.0)
+                for x, res in aisle_res.items():
+                    if len(res.queue) > 0:
+                        congested = [t for t in work_pool if graph.tile_x(t) == x]
+                        if congested:
+                            rest = [t for t in work_pool if graph.tile_x(t) != x]
+                            work_pool[:] = rest + congested
+                            reroute_count[0] += len(congested)
+
+        for pid in range(n_pickers):
+            env.process(_coordinated_picker(pid))
+        if model_aisle_contention:
+            env.process(_dispatcher())
+    else:
+        for rr in route_results:
+            env.process(picker_process(rr))
 
     env.run()
 
-    makespan  = float(env.now)
+    makespan  = float(max(dispatch_finish) if coordinated_dispatch and dispatch_finish
+                      else env.now)
     avg_time  = float(np.mean(pickrun_times)) if pickrun_times else 0.0
     all_waits = [w for ws in aisle_wait.values() for w in ws]
     avg_wait  = float(np.mean(all_waits)) if all_waits else 0.0
