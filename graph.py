@@ -33,6 +33,7 @@ class WarehouseGraph:
         self._adj: dict[str, list[tuple[str, float]]] = defaultdict(list)
         self._oneway_xs: set[int] = set()
         self._cache: dict[str, dict[str, float]] = {}
+        self._bidir_view: "WarehouseGraph | None" = None   # lazily built (3d)
         self._build(locations_df)
 
     # ------------------------------------------------------------------
@@ -131,6 +132,41 @@ class WarehouseGraph:
             return int(tile[1:4])
         except (ValueError, IndexError):
             return None
+
+    # ------------------------------------------------------------------
+    def bidirectional_view(self) -> "WarehouseGraph":
+        """Return a graph where one-way aisles are traversable in both directions.
+
+        Used for wide-machine routing (Task 3d): a counterbalance forklift
+        can't obey the narrow-aisle one-way circulation, so its route is
+        computed on a graph that contains *only* bidirectional edges — every
+        directed one-way edge ``u → v`` gets its reverse ``v → u`` added.
+
+        The result is cached, so repeated calls are free.  ``oneway_xs`` is
+        left intact (the DES still needs it to know which aisles are physically
+        narrow); only the routing adjacency is symmetrised.
+        """
+        if self._bidir_view is not None:
+            return self._bidir_view
+
+        twin = WarehouseGraph.__new__(WarehouseGraph)
+        twin._loc_to_tile = dict(self._loc_to_tile)
+        twin._oneway_xs   = set(self._oneway_xs)
+        twin._cache       = {}
+        twin._bidir_view  = twin   # already symmetric: it is its own view
+
+        # Symmetric closure of the adjacency: add the reverse of every edge.
+        adj: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        seen: dict[str, set[str]] = defaultdict(set)
+        for u, edges in self._adj.items():
+            for v, w in edges:
+                for a, b in ((u, v), (v, u)):
+                    if b not in seen[a]:
+                        adj[a].append((b, w))
+                        seen[a].add(b)
+        twin._adj = adj
+        self._bidir_view = twin
+        return twin
 
 
 def depot_distances(locations: pd.DataFrame) -> dict[str, float]:

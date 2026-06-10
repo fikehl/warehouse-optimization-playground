@@ -1,0 +1,264 @@
+================================================================================
+ TASK 3 — MIXED MACHINERY FLEET : RESULTS & IMPLEMENTATION REPORT
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ 0.  EXPERIMENT SETUP
+--------------------------------------------------------------------------------
+ Synthetic dataset (identical to run_demo.py):
+     generate(n_aisles=10, n_positions=20, n_items=300,
+              n_pickruns=500, n_days=1, seed=42)
+
+     - 200 locations (10 aisles x 20 positions)
+     - 500 pickruns, avg 4.8 items/run
+     - One-way aisles at x in {1, 3, 5, 7, 9} (odd columns, northbound only)
+
+ Routes: nearest-neighbor TSP (solver="nn").
+
+ IMPORTANT — releases synchronised to t=0 for all machine comparisons.
+     As in Task 2, the raw transaction timestamps stagger pickrun releases
+     across a ~16 h day, which makes the makespan RELEASE-BOUND: every fleet
+     finishes at ~957-958 min regardless of machine type, because the last
+     order simply can't start until it is released. Machine speed/pick-time
+     only drive the makespan once the system is throughput/contention-bound,
+     so every comparison below releases all pickruns at t=0 (SYNC_RELEASES).
+     Set SYNC_RELEASES=False in task3_machinery.py to see the release-bound
+     (all-tie) regime.
+
+ Reproduce:
+     python task3_machinery.py        # 3a / 3b / 3c / 3d, all sections
+
+
+--------------------------------------------------------------------------------
+ IMPORTANT FIX — pick time was not modelled per machine
+--------------------------------------------------------------------------------
+ The DES helper _pick_at() hard-coded the module constant PICK_TIME_S (4.0 s)
+ for every pick, so a MachineProfile's pick_time_s was IGNORED — only its
+ travel speed differed between machines. This understated slow-picking machines
+ (e.g. COUNTERBALANCE's 10 s pick) and overstated fast ones.
+
+ Fixed in des.py: _do_route() now takes the active picker's profile and
+ _pick_at(tile, pick_time_s) uses mp.pick_time_s. A reach truck (7 s) and a
+ human (4 s) now spend genuinely different times at each slot. This is why the
+ 3a numbers below differ from a speed-only model (e.g. REACH_TRUCK avg/run
+ rises from ~99 s speed-only to ~114 s with its true 7 s pick time).
+
+
+================================================================================
+ 3a.  PROFILE COMPARISON
+================================================================================
+ Question : Compare HUMAN / REACH_TRUCK / COUNTERBALANCE. Which minimises
+            makespan? Which minimises average pickrun time? Why does
+            COUNTERBALANCE show zero aisle-wait?
+
+ Profiles (des.py):
+   HUMAN          speed 1.5 m/s  pick 4 s   narrow_ok=True
+   REACH_TRUCK    speed 2.5 m/s  pick 7 s   narrow_ok=True
+   COUNTERBALANCE speed 3.5 m/s  pick 10 s  narrow_ok=False  detour_factor=2.2
+
+ Results (3 pickers, releases synchronised to t=0):
+
+  ----------------------------------------------------------------------------
+   Machine          | makespan(min) | avg/run(s) | avg aisle wait(s)
+  ----------------------------------------------------------------------------
+   human            |    419.6      |   151.0    |     4.41
+   reach_truck      |    316.8      |   114.0    |     3.26
+   counterbalance   |    358.1      |   128.7    |     0.00
+  ----------------------------------------------------------------------------
+
+ FINDINGS
+   * REACH_TRUCK minimises BOTH makespan (316.8 min) and avg pickrun time
+     (114.0 s). It wins because it is fast (2.5 m/s) AND can still use the
+     one-way aisles directly.
+   * COUNTERBALANCE is second (358.1 min) despite being the fastest machine
+     (3.5 m/s): its 2.2x detour penalty on every narrow-aisle leg plus its
+     slow 10 s pick cancel the raw speed advantage.
+   * HUMAN is slowest (419.6 min) — lowest travel speed dominates.
+   * COUNTERBALANCE shows EXACTLY ZERO aisle-wait because narrow_ok=False: it
+     never enters a one-way aisle and therefore never requests the aisle
+     Resource (des.py, the `if not mp.narrow_ok` branch). Instead of queuing it
+     pays a distance detour. No queue request => no recorded wait.
+
+ Release-bound regime (SYNC_RELEASES=False): all three finish at ~957-958 min;
+ the makespan is gated by the 16 h release window, not the machine.
+
+
+================================================================================
+ 3b.  ASSIGN PROFILES TO PICKERS  (per-item-class routing)
+================================================================================
+ Task asks: accept a list of profiles (one per picker slot); high-reach items
+ to REACH_TRUCK, ground-level heavy items to COUNTERBALANCE.
+
+ IMPLEMENTATION (option C — split the order, not just tag it)
+   A pickrun is a BASKET of mixed items, so a single eligibility set per order
+   cannot say "the heavy items need a counterbalance AND the high-rack items
+   need a reach truck". The correct model splits each order by the machine its
+   items require:
+
+   - run_des() gained two params:
+       machine_profiles : list[MachineProfile]  — one profile per picker slot.
+                          Spawns len(...) heterogeneous workers (overriding
+                          n_pickers) that draw from a shared simpy.FilterStore;
+                          each worker carries its own speed / pick-time /
+                          narrow-aisle behaviour.
+       pickrun_eligibility : list[set[str]]      — parallel to the routes; the
+                          set of profile NAMES allowed to serve each (sub-)route.
+                          A worker only pulls a route its profile name is in.
+                          run_des RAISES if any route's eligibility names no
+                          profile in the fleet (no silent drops).
+
+   - tsp.route_all_pickruns_by_class() splits each order by machine class into
+     separate depot->picks->depot sub-routes, returning (sub_routes,
+     eligibility) ready to pass straight into run_des. One order can thus be
+     served by up to three machines that consolidate at the depot (true zone
+     picking). Heavy-class sub-routes are routed with can_use_oneway=False
+     (the counterbalance can't obey one-way circulation — see 3d).
+
+   - The default item->class map is a weight-based slotting proxy:
+       heavy (>=500 kg) -> counterbalance   (floor level)
+       fragile (<=50 kg) -> reach_truck      (light, high rack)
+       normal           -> human
+
+ DATA CAVEAT — this dataset has no light goods
+   The synthetic slotting engine drops all light items: every SLOTTED item is
+   > 340 kg (min 342.7 kg) and ZERO items are <= 50 kg. So the default proxy
+   yields heavy=496 / high_reach=0 / normal=287 sub-routes — the reach truck
+   gets no work and the run is gated entirely by the counterbalance.
+   To exercise all three machine types, task3_machinery.py instead classifies
+   by TERCILES of the actual slotted weight range (heavy band -> counterbalance,
+   mid band -> reach_truck as a high-rack proxy, low band -> human), giving a
+   balanced split: heavy=407 / high_reach=406 / normal=403.
+
+ Results (per-tercile split, 500 orders -> 1216 class sub-routes, releases t=0;
+          avg/trip is per class sub-route, NOT per whole order):
+
+  ----------------------------------------------------------------------------
+   Fleet  (H=human R=reach C=counter)          | makespan(min) | avg/trip(s)
+  ----------------------------------------------------------------------------
+   1H 1R 1C   (one machine per class)          |    503.1      |    60.1
+   1H 1R 2C   (+ one counterbalance)           |    503.1      |    60.1
+   2H 1R 1C   (+ one human)                    |    384.3      |    60.8
+   3H 2R 2C   (balanced to workload)           |    192.3      |    62.8
+  ----------------------------------------------------------------------------
+
+ FINDINGS
+   * With one machine per class, makespan = the SINGLE busiest machine's
+     workload. Adding a 2nd counterbalance (1H1R2C) changes nothing (503.1 ->
+     503.1): the heavy class is NOT the bottleneck.
+   * Adding a 2nd human (2H1R1C) drops makespan to 384.3 min. Because the human
+     is the slowest machine (1.5 m/s vs reach 2.5, counter 3.5), the normal
+     class served by the human IS the bottleneck.
+   * A workload-balanced fleet (3H2R2C) reaches 192.3 min.
+   * LESSON: balance the fleet to the per-class workload AND machine speed, not
+     by raw headcount. The fastest machine (counterbalance) needs the fewest
+     slots; the slowest (human) needs the most.
+   * Capability routing is only worthwhile when classes are genuinely distinct
+     and balanced. On the raw all-heavy dataset (heavy=496/500) strict
+     "heavy -> counterbalance" funnels ~99% of work onto one machine and is
+     strictly worse than an unrestricted fleet — capability matching helps only
+     when the heavy subset is a minority.
+
+
+================================================================================
+ 3c.  NEW PROFILE — ELECTRIC PALLET JACK
+================================================================================
+ Profile : PALLET_JACK = MachineProfile("pallet_jack", speed_m_s=0.8,
+                                         pick_time_s=3.0)   (preset in des.py)
+           Slow travel (0.8 m/s, slower than a human) but a quick 3 s pick.
+
+ Question : At what picker count does it match the HUMAN baseline?
+
+ Results (releases synchronised to t=0):
+
+  ----------------------------------------------------------------------------
+   pickers | HUMAN makespan(min) | PALLET_JACK makespan(min) | jack / human
+  ----------------------------------------------------------------------------
+      1    |       1188.7        |        2047.5             |    1.72x
+      2    |        609.2        |        1050.4             |    1.72x
+      3    |        419.6        |         725.9             |    1.73x
+      4    |        323.1        |         559.5             |    1.73x
+      5    |        269.2        |         465.2             |    1.73x
+      6    |        233.5        |         405.8             |    1.74x
+      8    |        188.8        |         332.2             |    1.76x
+  ----------------------------------------------------------------------------
+
+ FINDINGS
+   * The pallet jack is a near-CONSTANT ~1.72-1.76x slower than a human at EVERY
+     picker count. At equal headcount it therefore NEVER matches the human
+     baseline. The ratio is fixed because the system is travel/pick-time-bound
+     and the jack is uniformly slower (0.8 vs 1.5 m/s, only partly offset by its
+     faster 3 s pick).
+   * To match a HUMAN fleet you need ~1.75x as many pallet jacks. Concretely, to
+     beat HUMAN@3 (419.6 min) you need 6 pallet jacks (405.8 min) — roughly
+     double the headcount.
+
+
+================================================================================
+ 3d.  ZONE-RESTRICTED ROUTING  (can_use_oneway flag)
+================================================================================
+ Change : route_pickrun() / route_all_pickruns() gained can_use_oneway (default
+          True). When False the route is computed on graph.bidirectional_view()
+          — a cached graph in which every one-way (odd-x) aisle edge is made
+          bidirectional ("only bidirectional edges"), modelling a wide machine
+          that can't obey the narrow-aisle one-way circulation. The returned
+          distance then reflects the actual re-routed path rather than the DES's
+          flat detour-penalty multiplier.  (graph.py: bidirectional_view();
+          tsp.py: can_use_oneway wired through both routing functions.)
+
+ Comparison (avg routed distance per run, 500 pickruns, solver="nn"):
+
+  ----------------------------------------------------------------------------
+   Approach                                          | avg dist/run | vs base
+  ----------------------------------------------------------------------------
+   one-way-respecting route (HUMAN baseline)         |   185.0 m    |   base
+   detour-penalty model (DES, 2.2x on one-way legs)  |   281.2 m    |  +52.0%
+   re-routed on bidirectional graph (3d)             |   120.9 m    |  -34.6%
+  ----------------------------------------------------------------------------
+   (detour-penalty distance computed by replaying each route under the DES rule:
+    every leg into a one-way-aisle tile multiplied by COUNTERBALANCE.detour_factor.)
+
+ FINDINGS
+   * The two wide-machine cost models disagree sharply: the flat 2.2x detour
+     penalty assumes the counterbalance travels +52% farther than the baseline,
+     while explicitly re-routing on the bidirectional graph gives -34.6% (it is
+     SHORTER than the baseline, because freed from the one-way constraint the
+     route no longer overshoots aisles to re-enter from the south).
+   * So the detour penalty is a PESSIMISTIC stand-in: it materially overstates
+     wide-machine travel relative to an explicit re-route.
+
+ HONEST CAVEAT
+   The bidirectional-view interpretation models "wide machine ignores the
+   one-way DIRECTION rule", not a literal physical detour around inaccessible
+   narrow aisles. A true detour model would EXCLUDE the narrow aisles entirely
+   and restrict the counterbalance to wide-aisle-only pickruns — which this
+   dataset doesn't cleanly support (items are scattered across all aisles, so a
+   counterbalance physically couldn't complete most orders). The flat detour
+   penalty remains the pragmatic "reach-in from the cross-aisle" approximation;
+   the comparison above quantifies how far apart the two assumptions are.
+
+
+================================================================================
+ IMPLEMENTATION SUMMARY (where to look in the code)
+================================================================================
+   graph.py
+     - bidirectional_view()          — cached symmetric-closure graph for 3d
+
+   tsp.py
+     - route_pickrun(..., can_use_oneway=True)        — routes on bidir view
+     - route_all_pickruns(..., can_use_oneway=True)   — forwards the flag
+     - route_all_pickruns_by_class()  — 3b per-class order splitting
+     - _default_item_class(), DEFAULT_CLASS_ELIGIBILITY — default class map
+
+   des.py
+     - PALLET_JACK preset                              — 3c
+     - run_des() new params: machine_profiles, pickrun_eligibility
+     - _do_route(rr, mp) parametrised by profile; _pick_at uses mp.pick_time_s
+     - mixed-fleet dispatch: simpy.FilterStore + per-profile workers + feeder
+     - eligibility guard (raises on unservable routes)
+
+   task3_machinery.py                  — runs all four sub-tasks (3a/3b/3c/3d)
+
+ To reproduce:
+     python task3_machinery.py
+================================================================================

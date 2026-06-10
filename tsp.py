@@ -643,6 +643,7 @@ def route_pickrun(
     item_weight: dict[str, float],
     solver: str = "nn",
     loc_zone: dict[str, str] | None = None,
+    can_use_oneway: bool = True,
     **solver_kwargs,
 ) -> RouteResult:
     """Route one pickrun respecting weight and optional cold-chain ordering.
@@ -659,8 +660,16 @@ def route_pickrun(
                      FREEZER so cold items spend the least time outside
                      refrigeration.  Within each zone, the heavy→normal→fragile
                      weight ordering still applies.
+    can_use_oneway : when False, the route is computed on the graph's
+                     bidirectional view (one-way aisles traversable both ways).
+                     Models a wide machine (e.g. COUNTERBALANCE) that can't obey
+                     the narrow-aisle one-way circulation (Task 3d).  The
+                     returned distance therefore reflects the actual re-routed
+                     path rather than the DES's flat detour-penalty multiplier.
     **solver_kwargs: forwarded to the solver (e.g. bucket_size=5, n_iter=6000)
     """
+    if not can_use_oneway:
+        graph = graph.bidirectional_view()
     # Build per-segment tile buckets.
     # With loc_zone: 9 buckets keyed (zone, weight_cls).
     # Without:       3 buckets keyed by weight_cls only (backward-compatible).
@@ -753,6 +762,7 @@ def route_all_pickruns(
     max_pickruns: int | None = None,
     solver: str = "nn",
     cold_last: bool = False,
+    can_use_oneway: bool = True,
     **solver_kwargs,
 ) -> list[RouteResult]:
     """Route every pickrun in ``transactions``.
@@ -768,6 +778,9 @@ def route_all_pickruns(
     solver        : routing algorithm — see module docstring for options
     cold_last     : enforce AMBIENT → CHILLER → FREEZER ordering so cold items
                     are picked at the end of each pickrun.  Requires locations_df.
+    can_use_oneway: when False, route on the bidirectional view of the graph
+                    (one-way aisles traversable both ways) for wide-machine
+                    pickruns — see ``route_pickrun`` (Task 3d).
     **solver_kwargs: forwarded to the solver (e.g. bucket_size=5)
 
     Returns
@@ -791,8 +804,119 @@ def route_all_pickruns(
         if rows.empty:
             continue
         rr = route_pickrun(rows, graph, item_weight,
-                           solver=solver, loc_zone=loc_zone, **solver_kwargs)
+                           solver=solver, loc_zone=loc_zone,
+                           can_use_oneway=can_use_oneway, **solver_kwargs)
         release = release_times.get(str(pr_no), 0.0)
         results.append(rr._replace(release_s=release))
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Per-machine-class routing (Task 3b, "option C": split a pickrun by the
+# machine each item needs, route each part independently)
+# ---------------------------------------------------------------------------
+
+# Default item → machine class.  Slotting proxy used in place of a real rack-
+# level attribute (the synthetic data has weight but no shelf height):
+#   • heavy goods sit at floor level    → a counterbalance forklift,
+#   • light / fragile goods sit up high → a reach truck,
+#   • everything else is human-pick height.
+DEFAULT_CLASS_ELIGIBILITY: dict[str, set[str]] = {
+    "heavy":      {"counterbalance"},
+    "high_reach": {"reach_truck"},
+    "normal":     {"human"},
+}
+
+
+def _default_item_class(weight: float) -> str:
+    if weight >= HEAVY_KG:
+        return "heavy"
+    if weight <= FRAGILE_KG:
+        return "high_reach"
+    return "normal"
+
+
+def route_all_pickruns_by_class(
+    transactions: pd.DataFrame,
+    graph: WarehouseGraph,
+    items_df: pd.DataFrame,
+    locations_df: pd.DataFrame | None = None,
+    max_pickruns: int | None = None,
+    solver: str = "nn",
+    cold_last: bool = False,
+    item_class=None,
+    class_eligibility: dict[str, set[str]] | None = None,
+    wide_classes: tuple[str, ...] = ("heavy",),
+    **solver_kwargs,
+) -> tuple[list[RouteResult], list[set[str]]]:
+    """Split every pickrun by machine class and route each part separately.
+
+    This is the physically-correct form of Task 3b: rather than assigning a
+    whole mixed pickrun to a single machine type, each pickrun is partitioned
+    by the machine class its items require, and every partition becomes its own
+    ``depot → picks → depot`` sub-route eligible only for the matching
+    profile(s).  A heavy-goods order, a high-rack order, and a normal order can
+    therefore be served by three different machines that consolidate at the
+    depot — true zone/class picking.
+
+    Parameters
+    ----------
+    item_class : callable(weight) -> str, or dict {item: class}, or None
+        Assigns each item to a machine class.  ``None`` uses the weight-based
+        slotting proxy ``_default_item_class`` (heavy / high_reach / normal).
+    class_eligibility : dict {class: set of profile names} or None
+        Which picker profiles may serve each class.  ``None`` uses
+        ``DEFAULT_CLASS_ELIGIBILITY``.
+    wide_classes : tuple of class names
+        Classes routed on the graph's bidirectional view
+        (``can_use_oneway=False``) because their machine can't obey the
+        one-way circulation — defaults to the counterbalance's ``"heavy"``.
+
+    Returns
+    -------
+    (sub_routes, eligibility)
+        Two parallel lists, ready to pass straight to
+        ``run_des(machine_profiles=..., pickrun_eligibility=...)``.
+    """
+    item_weight   = dict(zip(items_df["item"], items_df["weight"]))
+    release_times = _release_times(transactions)
+    class_elig    = class_eligibility or DEFAULT_CLASS_ELIGIBILITY
+
+    if item_class is None:
+        classify = lambda it: _default_item_class(item_weight.get(it, 0.0))
+    elif isinstance(item_class, dict):
+        classify = lambda it: item_class.get(it, "normal")
+    else:
+        classify = item_class
+
+    loc_zone: dict[str, str] | None = None
+    if cold_last:
+        if locations_df is None:
+            raise ValueError("cold_last=True requires locations_df")
+        loc_zone = dict(zip(locations_df["location_id"], locations_df["zone_type_1"]))
+
+    routes:      list[RouteResult] = []
+    eligibility: list[set[str]]    = []
+    n_orders = 0
+    for pr_no, grp in transactions.groupby("pickrun_no", sort=False):
+        if max_pickruns is not None and n_orders >= max_pickruns:
+            break
+        rows = grp[["item", "location_id"]].dropna()
+        if rows.empty:
+            continue
+        n_orders += 1
+        release = release_times.get(str(pr_no), 0.0)
+
+        # One sub-route per machine class present in this order.
+        for cls, sub in rows.groupby(rows["item"].map(classify)):
+            rr = route_pickrun(
+                sub, graph, item_weight,
+                solver=solver, loc_zone=loc_zone,
+                can_use_oneway=(cls not in wide_classes),
+                **solver_kwargs,
+            )
+            routes.append(rr._replace(release_s=release))
+            eligibility.append(set(class_elig.get(cls, {"human"})))
+
+    return routes, eligibility

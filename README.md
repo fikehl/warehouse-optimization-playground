@@ -132,11 +132,13 @@ run `run_demo.py`.
 | `restock_time_s` | 30.0 | Seconds to service one empty slot |
 | `fatigue_pct_per_100_picks` | 0.0 | Speed reduction per 100 picks (linear) |
 | `machine_profile` | `HUMAN` | Speed and pick-time profile for the picker fleet |
+| `machine_profiles` | `None` | Mixed fleet (3b): one `MachineProfile` per picker slot |
+| `pickrun_eligibility` | `None` | Per-pickrun set of profile names allowed to serve it (3b) |
 | `reroute_on_wait_s` | 0.0 | Re-order deferred tiles when aisle queue wait exceeds this |
 
 ### Machine profiles
 
-Three presets are available in `des.py`; construct a custom one with
+Four presets are available in `des.py`; construct a custom one with
 `MachineProfile(name, speed_m_s, pick_time_s, narrow_ok, detour_factor)`.
 
 | Preset | Speed | Pick time | Narrow aisles |
@@ -144,6 +146,7 @@ Three presets are available in `des.py`; construct a custom one with
 | `HUMAN` | 1.5 m/s | 4 s | ✓ enters and queues |
 | `REACH_TRUCK` | 2.5 m/s | 7 s | ✓ enters and queues |
 | `COUNTERBALANCE` | 3.5 m/s | 10 s | ✗ pays 2.2× detour penalty |
+| `PALLET_JACK` | 0.8 m/s | 3 s | ✓ enters and queues |
 
 ```python
 from des import run_des, REACH_TRUCK, MachineProfile
@@ -154,7 +157,52 @@ stats = run_des(routes, graph, n_pickers=3, machine_profile=REACH_TRUCK)
 # Build a custom profile (e.g. a slow electric pallet jack)
 pallet_jack = MachineProfile("pallet_jack", speed_m_s=1.0, pick_time_s=6.0)
 stats = run_des(routes, graph, n_pickers=4, machine_profile=pallet_jack)
+
+# Mixed fleet (3b): one profile per picker slot.  Each picker carries its own
+# speed / pick-time / narrow-aisle behaviour; pickrun_eligibility restricts
+# which profiles may serve each (sub-)route.
+stats = run_des(
+    routes, graph,
+    machine_profiles=[HUMAN, HUMAN, REACH_TRUCK, COUNTERBALANCE],
+    pickrun_eligibility=eligibility,   # list[set[str]] parallel to routes
+)
 ```
+
+The per-picker pick time now comes from each picker's `MachineProfile`
+(`pick_time_s`), so a reach truck (7 s) and a human (4 s) take different times at
+each slot — not just different travel speeds.
+
+**Per-item-class routing.** Because an order is a *basket* of mixed items, a
+single eligibility set per order can't say "the heavy items need a
+counterbalance *and* the high-rack items need a reach truck."
+`route_all_pickruns_by_class()` solves this by splitting each order by the
+machine its items require — each class becomes its own `depot → picks → depot`
+sub-route, tagged with the eligible profile(s) — so one order may be served by
+up to three machines that consolidate at the depot (true zone picking):
+
+```python
+from tsp import route_all_pickruns_by_class
+
+sub_routes, eligibility = route_all_pickruns_by_class(ds.transactions, graph, ds.items)
+stats = run_des(sub_routes, graph,
+                machine_profiles=[HUMAN, REACH_TRUCK, COUNTERBALANCE],
+                pickrun_eligibility=eligibility)
+```
+
+The default item→class map is a weight-based slotting proxy (heavy → floor /
+counterbalance, light → high rack / reach truck, rest → human); pass
+`item_class=` to override it.  Heavy-class sub-routes are routed with
+`can_use_oneway=False` (the counterbalance can't obey one-way aisles).  If a
+sub-route's eligibility names no profile in the fleet, `run_des` raises rather
+than silently dropping it.
+
+### Wide-machine routing (3d)
+
+`route_all_pickruns(..., can_use_oneway=False)` routes on the graph's
+**bidirectional view** (one-way aisles traversable both ways), modelling a wide
+machine that can't obey the narrow-aisle one-way circulation.  Compare the
+resulting routed distance against the DES detour-penalty model
+(`COUNTERBALANCE`, which inflates one-way legs by `detour_factor`).
 
 ---
 
@@ -374,10 +422,9 @@ of a single profile.  High-reach items should go to `REACH_TRUCK` pickers;
 ground-level heavy items to `COUNTERBALANCE`.
 
 **3c. New profile: electric pallet jack**
-Model a slow, narrow-aisle machine:
+A slow, narrow-aisle machine ships as the `PALLET_JACK` preset in `des.py`:
 ```python
-from des import MachineProfile
-pallet_jack = MachineProfile("pallet_jack", speed_m_s=0.8, pick_time_s=3.0)
+from des import PALLET_JACK   # MachineProfile("pallet_jack", speed_m_s=0.8, pick_time_s=3.0)
 ```
 At what picker count does it match the human baseline?
 

@@ -67,6 +67,7 @@ HUMAN          = MachineProfile("human",          speed_m_s=1.5,  pick_time_s=4.
 REACH_TRUCK    = MachineProfile("reach_truck",    speed_m_s=2.5,  pick_time_s=7.0)
 COUNTERBALANCE = MachineProfile("counterbalance", speed_m_s=3.5,  pick_time_s=10.0,
                                 narrow_ok=False, detour_factor=2.2)
+PALLET_JACK    = MachineProfile("pallet_jack",    speed_m_s=0.8,  pick_time_s=3.0)
 
 
 def run_des(
@@ -79,6 +80,8 @@ def run_des(
     restock_time_s: float = 30.0,
     fatigue_pct_per_100_picks: float = 0.0,
     machine_profile: MachineProfile | None = None,
+    machine_profiles: list[MachineProfile] | None = None,
+    pickrun_eligibility: list[set[str]] | None = None,
     reroute_on_wait_s: float = 0.0,
     reroute_solver: str = "nn",
     coordinated_dispatch: bool = False,
@@ -116,6 +119,23 @@ def run_des(
         ``HUMAN``, ``REACH_TRUCK``, or ``COUNTERBALANCE``, or build your own
         with ``MachineProfile(...)``.  ``None`` falls back to the module-level
         ``SPEED_M_S`` / ``PICK_TIME_S`` constants (equivalent to ``HUMAN``).
+        Ignored when ``machine_profiles`` is given.
+    machine_profiles : list[MachineProfile] | None
+        Mixed fleet (Task 3b): one profile per picker *slot*.  When given,
+        ``len(machine_profiles)`` heterogeneous workers are spawned (overriding
+        ``n_pickers``), each carrying its own speed / pick-time / narrow-aisle
+        profile, and pickruns are dispatched from a shared pool rather than via
+        anonymous resource slots.  A counterbalance worker, for instance, pays
+        the detour penalty on narrow aisles while a reach-truck worker queues
+        for them — within the same simulation.
+    pickrun_eligibility : list[set[str]] | None
+        Capability matching for the mixed fleet, parallel to ``route_results``:
+        ``pickrun_eligibility[i]`` is the set of profile *names* allowed to
+        serve pickrun ``i`` (e.g. ``{"counterbalance"}`` for a ground-level
+        heavy run, ``{"reach_truck", "human"}`` for a high-reach run).  A worker
+        only pulls a pickrun whose eligibility set contains its profile name.
+        ``None`` means any worker may serve any pickrun.  Only used when
+        ``machine_profiles`` is given.
     reroute_on_wait_s : float
         When > 0 and a picker arrives at a one-way aisle that already has
         waiters, they re-optimise their remaining non-blocked tiles with
@@ -148,7 +168,7 @@ def run_des(
         n_restock_events        — number of restock waits that occurred
         n_reroutes              — number of times a picker was rerouted mid-run
     """
-    mp        = machine_profile or HUMAN
+    mp_default = machine_profile or HUMAN
     env       = simpy.Environment()
     oneway_xs = graph.oneway_xs()
     rng       = np.random.default_rng(0)
@@ -187,9 +207,9 @@ def run_des(
         yield env.timeout(rr.release_s)
         with picker_pool.request() as req:
             yield req
-            yield from _do_route(rr)
+            yield from _do_route(rr, mp_default)
 
-    def _do_route(rr: RouteResult):
+    def _do_route(rr: RouteResult, mp: MachineProfile):
         t_start    = env.now
         tiles      = list(rr.route_tiles)   # mutable copy so rerouting can reorder
         prev       = tiles[0]
@@ -221,7 +241,7 @@ def run_des(
                         d = graph.distance(prev, t) * mp.detour_factor
                         yield env.timeout(d / eff_speed)
                         if t != graph.end_tile:
-                            yield from _pick_at(t)
+                            yield from _pick_at(t, mp.pick_time_s)
                             picks_done += 1
                         prev = t
                     i = j
@@ -249,7 +269,7 @@ def run_des(
                             for t in seg:
                                 yield env.timeout(graph.distance(prev, t) / eff_speed)
                                 if t != graph.end_tile:
-                                    yield from _pick_at(t)
+                                    yield from _pick_at(t, mp.pick_time_s)
                                     picks_done += 1
                                 prev = t
                             i = j
@@ -268,15 +288,19 @@ def run_des(
             else:
                 yield env.timeout(graph.distance(prev, tile) / eff_speed)
                 if tile != graph.end_tile:
-                    yield from _pick_at(tile)
+                    yield from _pick_at(tile, mp.pick_time_s)
                     picks_done += 1
                 prev = tile
                 i   += 1
 
         pickrun_times.append(env.now - t_start)
 
-    def _pick_at(tile: str):
-        """Yield pick-time events, inserting a restock wait when the slot is empty."""
+    def _pick_at(tile: str, pick_time_s: float):
+        """Yield pick-time events, inserting a restock wait when the slot is empty.
+
+        ``pick_time_s`` comes from the active picker's MachineProfile, so a
+        reach truck (7 s) and a human (4 s) spend different times at each slot.
+        """
         if (n_replenishers > 0
                 and replenish_prob > 0.0
                 and rng.random() < replenish_prob):
@@ -285,7 +309,7 @@ def run_des(
             yield restock_queue.put(done_event)
             yield done_event
             restock_waits.append(env.now - t_req)
-        yield env.timeout(PICK_TIME_S)
+        yield env.timeout(pick_time_s)
 
     # --- Coordinated dispatch (2c) — shared work-pool + central dispatcher ---
     if coordinated_dispatch:
@@ -305,10 +329,10 @@ def run_des(
                 tile = work_pool.pop(idx)
                 x    = graph.tile_x(tile)
 
-                eff_speed = mp.speed_m_s
+                eff_speed = mp_default.speed_m_s
                 if fatigue_pct_per_100_picks > 0.0:
                     reduction = (picks_done / 100.0) * (fatigue_pct_per_100_picks / 100.0)
-                    eff_speed = mp.speed_m_s * max(0.1, 1.0 - reduction)
+                    eff_speed = mp_default.speed_m_s * max(0.1, 1.0 - reduction)
 
                 if x is not None and x in aisle_res:
                     # Grab every available tile in this aisle at once so we
@@ -319,11 +343,11 @@ def run_des(
                     seg = sorted([tile] + same,
                                  key=lambda t: int(t.split("_")[1]))
 
-                    if not mp.narrow_ok:
+                    if not mp_default.narrow_ok:
                         for t in seg:
-                            d = graph.distance(cur, t) * mp.detour_factor
+                            d = graph.distance(cur, t) * mp_default.detour_factor
                             yield env.timeout(d / eff_speed)
-                            yield from _pick_at(t)
+                            yield from _pick_at(t, mp_default.pick_time_s)
                             picks_done += 1
                             cur = t
                     else:
@@ -333,12 +357,12 @@ def run_des(
                             aisle_wait[x].append(env.now - t_req)
                             for t in seg:
                                 yield env.timeout(graph.distance(cur, t) / eff_speed)
-                                yield from _pick_at(t)
+                                yield from _pick_at(t, mp_default.pick_time_s)
                                 picks_done += 1
                                 cur = t
                 else:
                     yield env.timeout(graph.distance(cur, tile) / eff_speed)
-                    yield from _pick_at(tile)
+                    yield from _pick_at(tile, mp_default.pick_time_s)
                     picks_done += 1
                     cur = tile
 
@@ -362,6 +386,52 @@ def run_des(
             env.process(_coordinated_picker(pid))
         if model_aisle_contention:
             env.process(_dispatcher())
+    elif machine_profiles is not None:
+        # --- Mixed fleet (3b) — N heterogeneous workers from a shared pool ---
+        # Each worker carries its own MachineProfile.  Pickruns are fed into a
+        # FilterStore at their release time; a worker only pulls a pickrun whose
+        # eligibility set contains the worker's profile name.
+        fleet = machine_profiles
+        elig  = pickrun_eligibility
+        store: simpy.FilterStore = simpy.FilterStore(env)
+        remaining = [len(route_results)]
+
+        # Fail loudly if a pickrun can never be served by the fleet on offer
+        # (otherwise it would sit in the FilterStore forever and be silently
+        # dropped from the makespan).
+        if elig is not None:
+            fleet_names = {p.name for p in fleet}
+            orphan = [i for i, e in enumerate(elig) if not (e & fleet_names)]
+            if orphan:
+                raise ValueError(
+                    f"{len(orphan)} pickrun(s) have eligibility sets no profile in "
+                    f"the fleet {sorted(fleet_names)} can satisfy "
+                    f"(e.g. pickrun {orphan[0]} needs {sorted(elig[orphan[0]])})."
+                )
+
+        def _feeder():
+            order = sorted(range(len(route_results)),
+                           key=lambda i: route_results[i].release_s)
+            clock = 0.0
+            for i in order:
+                rr = route_results[i]
+                if rr.release_s > clock:
+                    yield env.timeout(rr.release_s - clock)
+                    clock = rr.release_s
+                yield store.put((i, rr))
+
+        def _fleet_worker(wmp: MachineProfile):
+            while remaining[0] > 0:
+                if elig is None:
+                    item = yield store.get()
+                else:
+                    item = yield store.get(lambda it: wmp.name in elig[it[0]])
+                remaining[0] -= 1
+                yield from _do_route(item[1], wmp)
+
+        env.process(_feeder())
+        for wmp in fleet:
+            env.process(_fleet_worker(wmp))
     else:
         for rr in route_results:
             env.process(picker_process(rr))
