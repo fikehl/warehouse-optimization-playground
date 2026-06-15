@@ -10,7 +10,9 @@ contribution of each improvement added in Task 1:
   +sym+elite  — 1a + 1b combined
   all         — all three (the current default)
 
-The nn and 2opt solvers are included as reference points.
+All non-ACO solvers (nn, 2opt, or_opt, aisle_nn, bucketed, sa, mst) are
+included as reference points so the ACO variants are benchmarked against the
+full solver field (the same set run_demo.py compares).
 
 Usage
 -----
@@ -39,8 +41,15 @@ def main() -> None:
 
     VARIANTS = [
         # (label,          solver,  extra kwargs)
-        ("NN (reference)",  "nn",   {}),
-        ("2-opt (reference)", "2opt", {}),
+        # All non-ACO solvers as reference points (same field as run_demo.py),
+        # so the ACO variants are benchmarked against the whole solver set.
+        ("NN (reference)",       "nn",       {}),
+        ("2-opt (reference)",    "2opt",     {}),
+        ("or-opt (reference)",   "or_opt",   {}),
+        ("aisle-NN (reference)", "aisle_nn", {}),
+        ("bucketed (reference)", "bucketed", {}),
+        ("SA (reference)",       "sa",       {}),
+        ("MST (reference)",      "mst",      {}),
         ("ACO baseline",    "aco",  dict(symmetric_deposit=False, elitism=False, per_ant_2opt=False)),
         ("ACO +sym",        "aco",  dict(symmetric_deposit=True,  elitism=False, per_ant_2opt=False)),
         ("ACO +elite",      "aco",  dict(symmetric_deposit=False, elitism=True,  per_ant_2opt=False)),
@@ -57,10 +66,14 @@ def main() -> None:
 
     for label, solver, kw in VARIANTS:
         t0 = time.time()
-        rs = route_all_pickruns(
-            ds.transactions, graph, ds.items,
-            max_pickruns=200, solver=solver, **kw,
-        )
+        try:
+            rs = route_all_pickruns(
+                ds.transactions, graph, ds.items,
+                max_pickruns=200, solver=solver, **kw,
+            )
+        except ImportError as exc:
+            print(f"{label:<24}  skipped ({exc})")
+            continue
         elapsed  = time.time() - t0
         avg_dist = sum(r.total_dist_m for r in rs) / max(1, len(rs))
 

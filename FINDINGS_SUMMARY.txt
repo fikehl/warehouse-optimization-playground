@@ -1,0 +1,319 @@
+================================================================================
+ WAREHOUSE OPTIMISATION PLAYGROUND — KEY FINDINGS SUMMARY
+================================================================================
+ One-file digest of everything learned across the four exploration tasks
+ (ACO improvements, dynamic rerouting, mixed machinery, cold-chain) and the
+ README scenario recipes.  All numbers verified by re-running every script.
+
+ Baseline dataset used everywhere (unless stated otherwise):
+     generate(n_aisles=10, n_positions=20, n_items=300,
+              n_pickruns=500, n_days=1, seed=42)
+     10 aisles x 20 positions, one-way aisles at x in {1,3,5,7,9},
+     500 pickruns, avg 4.8 items/run.
+
+ Reproduce:  python run_demo.py, compare_aco.py,
+             task2a_threshold_sensitivity.py, task3_machinery.py,
+             task4_cold_chain.py, scenario_recipes.py
+
+
+================================================================================
+ 0.  THE SINGLE MOST IMPORTANT METHODOLOGICAL FINDING
+================================================================================
+
+ SYNC RELEASES FIRST, OR NOTHING IS MEASURABLE.
+
+ With raw transaction timestamps, pickruns are released across a ~16 h window
+ and the makespan is RELEASE-BOUND (~958 min at 3 pickers): the last order
+ simply cannot start until it is released.  In this regime, solver choice,
+ machine type, rerouting — everything — measures approximately zero effect.
+
+ Synchronising all releases to t=0 makes the system contention/throughput-
+ bound (419.6 min at 3 pickers), and only then do algorithm and fleet choices
+ actually move the needle.  Every experiment in this repo does this.
+
+ Practical lesson: before benchmarking any optimisation, check which regime
+ the system is in.  Optimising routing in a release-bound warehouse is wasted
+ effort — the order release schedule is the real bottleneck.
+
+
+================================================================================
+ 1.  TSP SOLVER COMPARISON  (which routing algorithm to use)
+================================================================================
+
+ Avg route distance per pickrun, 200-pickrun sample, default warehouse:
+
+   Solver              Avg dist   vs NN     Runtime   Verdict
+   ------------------  --------   ------    -------   -------------------------
+   NN (baseline)        181.1 m     base      0.2 s   fast, decent
+   NN + 2-opt           174.8 m    +3.5%      0.2 s   great default
+   NN + or-opt          173.3 m    +4.4%      0.2 s   BEST distance, still fast
+   Aisle-sorted NN      187.7 m    -3.6%      0.2 s   worse than NN here
+   Bucketed brute       175.5 m    +3.1%      0.3 s   fine, no advantage
+   Simulated annealing  173.7 m    +4.1%     ~13 s    good but slow
+   MST Christofides     204.3 m   -12.8%     ~2 s     worst — avoid
+   ACO (all improv.)    173.7 m    +4.1%     ~28 s    ties best, far slower
+
+ KEY TAKEAWAYS
+   * OR-OPT IS THE PRACTICAL WINNER: best average distance at sub-second
+     runtime.  2-opt is a close, equally cheap second.
+   * Metaheuristics (SA, ACO) only TIE the cheap local-search solvers on this
+     dataset — they do not justify their 50-100x runtime at this scale.
+   * MST/Christofides performs badly on this directed grid graph (greedy
+     matching + one-way asymmetry); not recommended.
+   * Aisle-sorted NN (S-shape sweep) loses when picks touch only a few aisles;
+     it sweeps columns wastefully.  (But see Section 5: it shines when zone
+     crossings are expensive.)
+
+ SCALE CHANGES THE RANKING (large warehouse: 20 aisles x 40 positions):
+   nn 485.6 m | 2opt 466.6 m | or_opt 467.2 m | ACO 464.7 m  <- ACO now BEST
+   Metaheuristic headroom grows with instance size (bigger per-segment TSPs).
+   On long pickruns (8+ picks/run) ACO also beats 2-opt by ~1%.
+   Rule of thumb: small/short pickruns -> or-opt; very large instances where
+   route quality is worth ~30 s of compute -> consider ACO.
+
+
+================================================================================
+ 2.  TASK 1 — IMPROVING ANT COLONY OPTIMISATION
+================================================================================
+
+ Three standard ACO improvements were added to the basic port, each toggleable:
+
+   Variant            Avg dist    Gain vs ACO base   Runtime cost
+   ----------------   --------    ----------------   ------------
+   ACO baseline        174.2 m         —              ~20 s
+   + symmetric (1a)    173.9 m       +0.2%            none
+   + elitism  (1b)     173.6 m       +0.3%            none
+   + per-ant 2-opt(1c) 173.7 m       +0.3%            ~+30%
+   all three           173.7 m       +0.3%            ~+35%
+
+ KEY TAKEAWAYS
+   * ELITISM (extra pheromone along the global-best tour each iteration) has
+     the best cost/benefit of any ACO improvement: same gain as per-ant 2-opt
+     at ZERO runtime cost.  Recommended default-on for any ACO deployment.
+   * Symmetric pheromone deposit is a small free gain on this mostly-
+     bidirectional graph (one-way penalties stay encoded in the distance
+     matrix, so directionality is preserved anyway).
+   * Per-ant 2-opt gives the same gain but costs ~30% runtime; only worth it
+     on longer pick lists where 2-opt has more to fix.
+   * IMPROVEMENTS ARE NOT ADDITIVE: all three combined gain no more than
+     elitism alone.  Once any one improvement steers the colony into the good
+     region, the others find little extra within the same iteration budget.
+   * Absolute gains are small (~0.3%) because pickruns average only 4.8 items;
+     gains grow with instance size (see Section 1, large warehouse).
+
+
+================================================================================
+ 3.  TASK 2 — DYNAMIC REROUTING  (dodging one-way aisle queues)
+================================================================================
+
+ Mechanism: a picker waiting at a one-way aisle longer than reroute_on_wait_s
+ gives up (SimPy reneging), re-solves its remaining un-blocked tiles, and
+ defers the blocked aisle to the end of the route.
+
+ BUG FIX THAT MADE THIS MEASURABLE: the original heuristic rerouted instantly
+ on any queue and ignored the threshold entirely (5 s and 60 s gave identical
+ results).  The renege pattern `req | env.timeout(threshold)` fixed it.
+
+ 3a. THRESHOLD SENSITIVITY (default warehouse, synced releases)
+   * Rerouting helps MORE under HIGH contention: best gains +1.2% (3 pickers)
+     and +0.8% (5 pickers) vs +0.4% (2 pickers).  Reroute events scale with
+     contention: 317 fires at 5 pickers vs 41 at 2 (threshold 5 s).
+   * Lower thresholds help more (more aggressive dodging), with diminishing
+     returns past ~20 s.
+   * The absolute payoff is SMALL (always < 1.5% makespan): aisle waits are a
+     minor slice of total pick work even under full contention.
+   * It can BACKFIRE (-0.2% at 2 pickers / 20 s): detouring around a queue
+     that would have cleared quickly costs more than waiting.
+
+ 3b. RE-SOLVE BEATS PLAIN DEFERRAL
+   Re-running a proper TSP solver on the remaining tiles roughly DOUBLES the
+   gain vs a plain greedy re-order at the same threshold:
+     nn re-solve  +1.24%  ->  2opt re-solve  +2.15%  (threshold 5 s, 3 pickers)
+   2opt and or_opt are nearly tied.  Cost is negligible at ~5 picks/run.
+
+ 3c. REROUTING CAN GO BADLY WRONG (small dense warehouse, 4 aisles)
+   In a 4-aisle warehouse with only two one-way aisles, rerouting HURTS:
+   -7 to -9% at 3 pickers, ~-21% at 5 pickers.  With nowhere useful to go,
+   pickers defer, walk extra distance, return — and the queue is still there
+   (everyone else did the same).  Deferral adds travel without avoiding waits.
+
+   => REROUTING VALUE IS NON-MONOTONIC IN CONTENTION:
+      low contention        -> nothing to dodge (no effect)
+      moderate, many aisles -> small win (+1-2%)
+      saturated, few aisles -> active thrashing (up to -21%)
+   A production rule should check queue depth AND availability of alternative
+   work, not just elapsed wait time.
+
+ 3d. COORDINATED DISPATCH (shared work pool, no per-order routes)
+   A central pool where pickers continuously grab the nearest remaining tile
+   cuts makespan ~85-87% vs per-pickrun routing (e.g. 419.6 -> 56.2 min at 3
+   pickers).  HONEST CAVEAT: this is NOT like-for-like — most of the gain
+   comes from eliminating the per-order depot round-trip, not from load
+   balancing.  It answers a different operational question (continuous batch
+   picking vs discrete cart-based orders), but shows the ceiling: order
+   consolidation dwarfs any within-order routing improvement.
+
+
+================================================================================
+ 4.  TASK 3 — MACHINERY: WHICH VEHICLES, HOW MANY
+================================================================================
+
+ Profiles:  HUMAN 1.5 m/s, 4 s pick | REACH_TRUCK 2.5 m/s, 7 s pick |
+            COUNTERBALANCE 3.5 m/s, 10 s pick, can't enter narrow aisles
+            (pays 2.2x detour) | PALLET_JACK 0.8 m/s, 3 s pick.
+
+ BUG FIX THAT MADE THIS MEASURABLE: the DES hard-coded a 4 s pick time for
+ every machine; pick_time_s from the profile was ignored.  Now each machine
+ pays its true per-slot time.
+
+ 4a. SINGLE-TYPE FLEET COMPARISON (3 pickers, synced releases)
+     human           419.6 min   avg/run 151.0 s   aisle wait 4.41 s
+     reach_truck     316.8 min   avg/run 114.0 s   aisle wait 3.26 s   <- WINS
+     counterbalance  358.1 min   avg/run 128.7 s   aisle wait 0.00 s
+
+   * REACH TRUCK wins both makespan and per-run time: fast AND narrow-capable.
+   * Counterbalance is fastest on paper (3.5 m/s) but its 2.2x narrow-aisle
+     detour + slow 10 s pick cancel the speed advantage.
+   * Counterbalance shows exactly 0 aisle wait BY CONSTRUCTION: it never
+     requests the aisle resource (narrow_ok=False) — it detours instead of
+     queuing.  Zero wait is not "no congestion cost"; the cost moved into
+     travel distance.
+
+ 4b. MIXED FLEET + CAPABILITY ROUTING (split orders by item class)
+   Orders are baskets of mixed items, so capability matching must split each
+   order into per-machine-class sub-routes (heavy -> counterbalance, high-rack
+   -> reach truck, rest -> human) that consolidate at the depot.
+
+     Fleet                      Makespan
+     1H 1R 1C  (one per class)  503.1 min
+     1H 1R 2C  (+counterbal.)   503.1 min   <- adding to a non-bottleneck: ZERO
+     2H 1R 1C  (+human)         384.3 min   <- adding to the bottleneck: -24%
+     3H 2R 2C  (balanced)       192.3 min
+
+   * Makespan = the busiest single machine class's workload.  BALANCE THE
+     FLEET TO PER-CLASS WORKLOAD x MACHINE SPEED, not raw headcount: the
+     slowest machine (human) needs the most slots, the fastest the fewest.
+   * Capability routing only pays when classes are balanced.  If one class
+     dominates (this dataset: 99% "heavy" under the naive weight proxy),
+     strict matching funnels all work onto one machine type and is strictly
+     worse than an unrestricted fleet.
+
+ 4c. SLOW-BUT-CHEAP MACHINES: HEADCOUNT EQUIVALENCE
+   The pallet jack (0.8 m/s) is a near-constant 1.72-1.76x slower than a human
+   at EVERY picker count — its fast 3 s pick only partly offsets slow travel.
+   It never matches human makespan at equal headcount; you need ~1.75x as many
+   jacks (6 jacks ~ 3 humans).  Fleet economics reduce to a simple ratio when
+   the system is travel/pick-bound.
+
+ 4d. WIDE-MACHINE COST MODELS DISAGREE SHARPLY
+   Two ways to model "counterbalance can't use one-way aisles":
+     flat 2.2x detour penalty on one-way legs (DES model):  +52% distance
+     explicit re-route on a bidirectional graph view:       -35% distance
+   The flat penalty is PESSIMISTIC; the bidirectional re-route is OPTIMISTIC
+   (ignoring the one-way rule actually SHORTENS routes — no more overshooting
+   an aisle to re-enter from the south).  Truth is between; pick the model to
+   match the physical reality (reach-in from cross-aisle vs rule-exempt).
+
+
+================================================================================
+ 5.  TASK 4 — COLD-CHAIN CONSTRAINTS
+================================================================================
+
+ cold_last=True forces AMBIENT -> CHILLER -> FREEZER pick order (on top of
+ heavy -> normal -> fragile), so cold items spend the least time in the cart.
+
+ 5a. THE RAW ORDER DATA VIOLATES COLD-CHAIN OFTEN
+   Avg ordering violations per pickrun: 0.55 (weight only) -> 1.18 (+cold
+   axis).  The +0.62 difference = cold items the raw sequence would pick
+   before ambient ones.  NOTE: this metric is a property of the INPUT data,
+   not the solver — it is identical across all eight solvers by construction.
+
+ 5b. THE CONSTRAINT IS FREE — IF ZONES ARE GROUPED
+     Layout                      base      cold-last    penalty
+     grouped (realistic)        185.0 m     180.9 m      -2.2%   <- CHEAPER
+     interspersed (random)      189.6 m     209.8 m     +10.6%
+     80% cold + interspersed    190.2 m     211.6 m     +11.3%
+
+   * In a realistic zone-grouped warehouse, enforcing cold-last actually
+     REDUCES distance (picking the cold block last removes backtracking).
+   * ZONE GROUPING, NOT COLD SHARE, drives compliance cost: 80% cold costs
+     about the same as 30% cold when both are interspersed (+11% vs +10.6%).
+   * Slotting layout and the cold-chain rule interact: good zone grouping
+     makes compliance free.
+
+ 5c. DWELL TIME IS THE RIGHT COMPLIANCE METRIC (not violation counts)
+   Dwell = seconds a cold item rides in the cart from pick to pickrun end.
+   Even a perfectly ordered route keeps the first CHILLER item in the cart
+   through the whole FREEZER segment — ordering checks miss that exposure.
+     plain NN routes:     avg dwell 104.3 s, max 338.7 s  (678 cold picks)
+     cold-last NN routes: avg dwell  32.7 s, max 138.7 s  (same 678 picks)
+   => cold-last cuts average cold exposure ~69% and worst-case ~59%, at
+      essentially zero distance cost in the grouped layout.  Strong argument
+      for enabling cold_last=True by default in production.
+
+ 5d. EXPENSIVE ZONE CROSSINGS FLIP THE WINNING SOLVER
+   With a 60 s handling penalty per temperature-zone boundary crossing
+   (3 pickers, synced releases):
+     Routing         no penalty     with penalty    crossings
+     nn              419.6 min      697.0 min          766
+     2opt            401.3 min  <-W 660.2 min          733
+     aisle_nn        428.8 min      651.8 min          653
+     nn cold-last    412.6 min      572.7 min  <-WIN    472
+   * Without the penalty, the pure distance minimiser (2opt) wins; with it,
+     cold-last wins decisively because it crosses the fewest boundaries.
+   * THE RIGHT SOLVER DEPENDS ON THE COST STRUCTURE: when transitions (doors,
+     PPE changes, handling) dominate, zone-aware ordering beats raw shortest
+     distance.  Distance is not always the objective.
+
+
+================================================================================
+ 6.  CROSS-CUTTING LESSONS
+================================================================================
+
+ 1. CHECK THE REGIME FIRST.  Release-bound systems are insensitive to every
+    optimisation in this repo; sync releases (or fix the release schedule)
+    before tuning anything else.  (Section 0)
+
+ 2. CHEAP LOCAL SEARCH IS HARD TO BEAT.  or-opt/2-opt capture nearly all the
+    distance gain at ~0 cost.  Metaheuristics (ACO, SA) only earn their
+    runtime on large instances / long pickruns.  (Sections 1-2)
+
+ 3. STRUCTURAL CHANGES DWARF ALGORITHMIC TUNING.  Solver improvements move
+    distance by 3-5%; rerouting moves makespan by ~1-2%; but consolidating
+    orders into a shared work pool moves makespan by ~85%, and fleet
+    rebalancing by ~60%.  Optimise the operation before the algorithm.
+    (Sections 3d, 4b)
+
+ 4. ADD CAPACITY AT THE BOTTLENECK, MEASURE EVERYTHING ELSE AS ZERO.  An
+    extra counterbalance changed nothing; an extra human cut 24%.  (4b)
+
+ 5. HEURISTICS NEED ESCAPE CONDITIONS.  Rerouting helps modestly in the right
+    regime and destroys 21% of throughput in the wrong one.  Guard dynamic
+    policies with state checks (queue depth, alternative work), not just
+    thresholds.  (3c)
+
+ 6. CONSTRAINTS CAN BE FREE.  Cold-last looks like a restriction but reduces
+    distance in a zone-grouped layout while cutting cold exposure ~69%.
+    Always measure a constraint's real cost before resisting it.  (5b, 5c)
+
+ 7. METRICS CAN LIE BY CONSTRUCTION.  Counterbalance's "zero aisle wait" is
+    an accounting artefact; ordering_fixes measures input data, not solver
+    quality; dwell time, not violation counts, measures cold exposure.
+    Understand what a metric mechanically measures before ranking on it.
+    (4a, 5a, 5c)
+
+ 8. SYNTHETIC-DATA ARTEFACTS TO KNOW (documented in scenario_recipes.txt):
+    - Transactions draw items UNIFORMLY — picks_30/60 demand columns do not
+      affect routing/DES results (skewed-demand experiments are no-ops).
+    - picks_trend ~ 0.5 means steady (not 1.0); thresholds 0.65/0.35 are the
+      sensible accelerating/declining flags, not the README's 1.3/0.7.
+    - The slotting engine drops all light items (min slotted weight ~343 kg),
+      so weight-based "fragile/high-rack" classes find nothing by default.
+    - Cold-chain experiments must edit ds.locations zones (routing reads
+      location zones); editing ds.items zones post-generation is a no-op.
+
+================================================================================
+ END — full details and reproduction scripts:
+   task1_aco_improvements.txt | task2_dynamic-rerouting.txt
+   task3_mixed-machinery.txt  | task4_cold-chain.txt | scenario_recipes.txt
+================================================================================

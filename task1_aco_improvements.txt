@@ -135,16 +135,28 @@ Variant                   Avg dist/run   vs 2-opt   vs baseline    Time
 ────────────────────────  ────────────  ─────────  ────────────  ──────
 NN  (reference)               181.1 m       base             —    0.2s
 2-opt  (reference)            174.8 m       base             —    0.2s
-ACO baseline                  174.2 m      +0.4%             —   20.6s
-ACO +sym only                 173.9 m      +0.6%         +0.2%   20.4s
-ACO +elite only               173.6 m      +0.7%         +0.3%   20.6s
-ACO +2opt only                173.7 m      +0.7%         +0.3%   26.0s
-ACO +sym+elite (no 2opt)      173.7 m      +0.6%         +0.3%   20.2s
-ACO all three                 173.7 m      +0.6%         +0.3%   27.7s
+or-opt  (reference)           173.3 m      +0.9%             —    0.2s
+aisle-NN  (reference)         187.7 m      -7.3%             —    0.2s
+bucketed  (reference)         175.5 m      -0.4%             —    0.3s
+SA  (reference)               173.7 m      +0.6%             —   13.2s
+MST  (reference)              204.3 m     -16.9%             —    1.9s
+ACO baseline                  174.2 m      +0.4%             —   20.9s
+ACO +sym only                 173.9 m      +0.6%         +0.2%   21.2s
+ACO +elite only               173.6 m      +0.7%         +0.3%   20.9s
+ACO +2opt only                173.7 m      +0.7%         +0.3%   27.5s
+ACO +sym+elite (no 2opt)      173.7 m      +0.6%         +0.3%   21.1s
+ACO all three                 173.7 m      +0.6%         +0.3%   28.0s
 
 Notes
+  • All non-ACO solvers are now shown as reference points (the same field
+    run_demo.py compares), so ACO is benchmarked against the whole set — not
+    just nn/2opt.
   • "vs 2-opt"    — positive = shorter than 2-opt reference (better)
   • "vs baseline" — positive = shorter than ACO with no improvements (better)
+  • Among all solvers, the best are or-opt (173.3 m), SA and ACO-all-three
+    (173.7 m) — effectively tied. aisle-NN (S-shape) and MST trail badly here
+    (187.7 m / 204.3 m). So the improved ACO is competitive with the best
+    distance-based solvers, just far slower (≈28 s vs <1 s for or-opt).
   • Absolute differences are small because this synthetic dataset has short
     pick lists (avg 4.8 items/run); on longer runs the relative gains would
     be larger.

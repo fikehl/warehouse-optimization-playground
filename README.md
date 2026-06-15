@@ -135,6 +135,8 @@ run `run_demo.py`.
 | `machine_profiles` | `None` | Mixed fleet (3b): one `MachineProfile` per picker slot |
 | `pickrun_eligibility` | `None` | Per-pickrun set of profile names allowed to serve it (3b) |
 | `reroute_on_wait_s` | 0.0 | Re-order deferred tiles when aisle queue wait exceeds this |
+| `zone_lookup` | `None` | `{tile: zone}` map — enables cold-item dwell tracking (4c) |
+| `zone_cross_penalty_s` | 0.0 | Seconds added per consecutive-tile zone change (4d) |
 
 ### Machine profiles
 
@@ -256,6 +258,7 @@ deliberately tuned to match the production warehouse:
 | `max_lines_per_run` | 8 | Upper bound on picks per order (uniform draw from [2, max]) |
 | `n_days` | 90 | Spread pickruns across this many calendar days |
 | `seed` | 42 | Random seed; change it to get a different-but-equally-valid instance |
+| `random_zones` | False | Intersperse cold zones across all aisles instead of grouping by aisle (4b) |
 
 ### Scenario recipes
 
@@ -313,10 +316,11 @@ ds.items["zone_type_1"] = np.where(
 Then compare routes with and without `cold_last=True` — the ordering_fixes
 difference quantifies how badly the unconstrained solver violates cold-chain.
 
-**Zone-crossing experiments** — the current DES ignores zone boundaries.  Add
-a zone-crossing penalty by checking whether consecutive tiles in a route cross
-from one zone to another, and injecting an `env.timeout(penalty_s)` for each
-crossing (a natural extension of `_do_route` in `des.py`).
+**Zone-crossing experiments** — `run_des(zone_lookup=..., zone_cross_penalty_s=s)`
+adds an `env.timeout(s)` whenever two consecutive picked tiles belong to
+different zones (4d), and `zone_lookup` alone enables cold-item dwell tracking
+(4c, the `*_cold_dwell_s` return keys).  Pass `tile_zone` as
+`{graph.loc_to_tile(loc): zone for loc, zone in zip(locs.location_id, locs.zone_type_1)}`.
 
 ### Plugging in real data
 

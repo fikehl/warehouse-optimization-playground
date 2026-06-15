@@ -85,6 +85,8 @@ def run_des(
     reroute_on_wait_s: float = 0.0,
     reroute_solver: str = "nn",
     coordinated_dispatch: bool = False,
+    zone_lookup: dict[str, str] | None = None,
+    zone_cross_penalty_s: float = 0.0,
 ) -> dict:
     """Simulate all pickruns and return aggregate statistics.
 
@@ -154,6 +156,21 @@ def run_des(
         pool.  Exactly ``n_pickers`` workers draw from the pool until it
         is empty.  Incompatible with per-pickrun release times (all tiles
         start at t=0).
+    zone_lookup : dict[str, str] | None
+        ``{tile_id: zone_type_1}`` map.  When provided the DES becomes
+        temperature-aware:
+          • Cold-chain dwell time (4c) is tracked for every CHILLER/FREEZER
+            pick — the seconds from when the cold item is picked until its
+            pickrun finishes (it stays in the cart that whole time).  Surfaced
+            in the ``*_cold_dwell_s`` return keys.
+          • Enables the zone-crossing penalty when ``zone_cross_penalty_s > 0``.
+        Not tracked in ``coordinated_dispatch`` mode (no per-pickrun grouping).
+    zone_cross_penalty_s : float
+        Seconds added (``env.timeout``) whenever two consecutive picked tiles
+        belong to different zones (4d) — models the handling/door overhead of
+        moving between temperature areas.  Requires ``zone_lookup``.  Routes
+        that cluster picks by zone (e.g. ``cold_last=True``) cross fewer zone
+        boundaries and so pay less penalty.
 
     Returns
     -------
@@ -167,11 +184,26 @@ def run_des(
         avg_restock_wait_s      — mean restock-wait per individual restock event
         n_restock_events        — number of restock waits that occurred
         n_reroutes              — number of times a picker was rerouted mid-run
+        avg_cold_dwell_s        — mean cold-item dwell time (0 without zone_lookup)
+        max_cold_dwell_s        — longest single cold-item dwell time
+        total_cold_dwell_s      — sum of all cold-item dwell times
+        n_cold_picks            — number of CHILLER/FREEZER picks observed
+        n_zone_crossings        — number of consecutive-tile zone changes penalised
     """
     mp_default = machine_profile or HUMAN
     env       = simpy.Environment()
     oneway_xs = graph.oneway_xs()
     rng       = np.random.default_rng(0)
+
+    # Temperature awareness (Task 4c/4d).  A tile is "cold" if its zone is
+    # CHILLER or FREEZER.  zone_of() returns None for the depot / unmapped tiles.
+    zone_lookup = zone_lookup or {}
+
+    def zone_of(tile: str) -> str | None:
+        return zone_lookup.get(tile)
+
+    cold_dwells:    list[float] = []   # 4c: per cold-pick dwell times (seconds)
+    zone_crossings: list[int]   = [0]  # 4d: penalised consecutive-tile crossings
 
     picker_pool = simpy.Resource(env, capacity=max(1, n_pickers))
     aisle_res: dict[int, simpy.Resource] = (
@@ -215,6 +247,18 @@ def run_des(
         prev       = tiles[0]
         picks_done = 0
         i          = 1
+        cold_pick_times: list[float] = []   # 4c: when each cold item entered cart
+
+        def _arrive(from_tile: str, to_tile: str):
+            """Cross-zone penalty (4d) + pick + cold-dwell bookkeeping (4c)."""
+            if zone_cross_penalty_s > 0.0:
+                zf, zt = zone_of(from_tile), zone_of(to_tile)
+                if zf is not None and zt is not None and zf != zt:
+                    zone_crossings[0] += 1
+                    yield env.timeout(zone_cross_penalty_s)
+            yield from _pick_at(to_tile, mp.pick_time_s)
+            if zone_of(to_tile) in ("CHILLER", "FREEZER"):
+                cold_pick_times.append(env.now)
 
         while i < len(tiles):
             tile = tiles[i]
@@ -241,7 +285,7 @@ def run_des(
                         d = graph.distance(prev, t) * mp.detour_factor
                         yield env.timeout(d / eff_speed)
                         if t != graph.end_tile:
-                            yield from _pick_at(t, mp.pick_time_s)
+                            yield from _arrive(prev, t)
                             picks_done += 1
                         prev = t
                     i = j
@@ -269,7 +313,7 @@ def run_des(
                             for t in seg:
                                 yield env.timeout(graph.distance(prev, t) / eff_speed)
                                 if t != graph.end_tile:
-                                    yield from _pick_at(t, mp.pick_time_s)
+                                    yield from _arrive(prev, t)
                                     picks_done += 1
                                 prev = t
                             i = j
@@ -288,12 +332,16 @@ def run_des(
             else:
                 yield env.timeout(graph.distance(prev, tile) / eff_speed)
                 if tile != graph.end_tile:
-                    yield from _pick_at(tile, mp.pick_time_s)
+                    yield from _arrive(prev, tile)
                     picks_done += 1
                 prev = tile
                 i   += 1
 
         pickrun_times.append(env.now - t_start)
+        # 4c: each cold item dwelled from its pick until the pickrun finished.
+        t_end = env.now
+        for tp in cold_pick_times:
+            cold_dwells.append(t_end - tp)
 
     def _pick_at(tile: str, pick_time_s: float):
         """Yield pick-time events, inserting a restock wait when the slot is empty.
@@ -465,4 +513,9 @@ def run_des(
         "avg_restock_wait_s":   avg_rw,
         "n_restock_events":     len(restock_waits),
         "n_reroutes":           reroute_count[0],
+        "avg_cold_dwell_s":     float(np.mean(cold_dwells)) if cold_dwells else 0.0,
+        "max_cold_dwell_s":     float(max(cold_dwells)) if cold_dwells else 0.0,
+        "total_cold_dwell_s":   float(sum(cold_dwells)),
+        "n_cold_picks":         len(cold_dwells),
+        "n_zone_crossings":     zone_crossings[0],
     }

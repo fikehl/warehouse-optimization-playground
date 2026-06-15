@@ -1,0 +1,219 @@
+================================================================================
+ SCENARIO RECIPES : RESULTS & FINDINGS REPORT
+================================================================================
+ The README's "Scenario recipes" section lists seven generator variations plus
+ a zone-crossing pointer.  Each recipe was run against the task it stresses
+ most plausibly.  Reproduce everything with:
+
+     python scenario_recipes.py
+
+
+--------------------------------------------------------------------------------
+ R1.  BUSY SINGLE SHIFT      generate(n_pickruns=500, n_days=1, seed=42)
+--------------------------------------------------------------------------------
+ Relevance: this recipe is already the BASELINE of every task script (tasks
+ 1-4 all use it).  What it exposes is the DES regime split:
+
+  ------------------------------------------------------------------
+   release model                  | makespan (3 pickers) | aisle wait
+  ------------------------------------------------------------------
+   staggered (raw timestamps)     |      958.1 min       |   1.86 s
+   synchronised (all at t=0)      |      419.6 min       |   4.41 s
+  ------------------------------------------------------------------
+
+ FINDING
+   With raw timestamps the makespan is RELEASE-BOUND (pinned to the ~16 h
+   release window) and almost nothing moves it — machine type, rerouting and
+   solver choice all measure ~zero.  Synchronising releases to t=0 makes the
+   system contention/throughput-bound.  This is why every task experiment in
+   this repo syncs releases before measuring anything.
+
+
+--------------------------------------------------------------------------------
+ R2.  LARGE WAREHOUSE        generate(n_aisles=20, n_positions=40,
+                                       n_items=800, n_pickruns=1000)
+--------------------------------------------------------------------------------
+ Relevance: Task 1 (solver comparison at scale) + DES scaling.
+ 800 locations, 10 one-way aisles.
+
+  Solver comparison (200-run sample):        DES (nn routes, synced):
+  ----------------------------------        -------------------------------
+   nn          485.6 m     0.7s              3 pickers : 30.71 h  wait 5.2 s
+   2opt        466.6 m     0.2s              6 pickers : 16.49 h  wait 15.2 s
+   or_opt      467.2 m     0.2s
+   aisle_nn    506.3 m     0.2s
+   aco         464.7 m    28.7s
+  ----------------------------------
+
+ FINDINGS
+   * Per-run distance roughly 2.6x the default warehouse (longer, more aisles).
+   * ACO becomes the BEST solver at this scale (464.7 m, beating 2opt's 466.6)
+     — bigger per-segment TSPs give the metaheuristic real headroom, consistent
+     with the Task 1 conclusion that ACO gains grow with instance size.  Its
+     runtime cost (28.7 s vs 0.2 s) remains the trade-off.
+   * aisle_nn's S-shape sweep degrades relatively (+4% vs nn): sweeping all 20
+     aisle columns is wasteful when picks touch only a few.
+
+
+--------------------------------------------------------------------------------
+ R3.  SMALL DENSE WAREHOUSE  generate(n_aisles=4, n_positions=30,
+                                       n_items=100, max_lines_per_run=15)
+--------------------------------------------------------------------------------
+ Relevance: Task 1 (ACO headroom on long pickruns) and Task 2 (rerouting under
+ maximum contention).  8.2 picks/run, only TWO one-way aisles (x in {1,3}).
+
+ Task 1 angle (120-run sample):
+  ------------------------------------------
+   nn         259.8 m          2opt  256.8 m
+   ACO base   254.2 m          ACO all 254.2 m
+  ------------------------------------------
+   ACO beats 2opt by ~1% here — more headroom than the default dataset (where
+   it ties).  The three Task 1 improvements add nothing on top of base ACO in
+   this instance; the colony already converges on the small 4-aisle graph.
+
+ Task 2 angle — rerouting payoff, synced releases
+ (% = makespan improvement vs no-rerouting baseline; NEGATIVE = worse):
+  --------------------------------------------------------------
+   pickers | baseline  | thr=5s   | thr=10s  | thr=30s
+  --------------------------------------------------------------
+      3    |  711.5 min|  -8.9%   |  -8.3%   |  -7.2%
+      5    |  627.1 min| -20.9%   | -21.0%   | -20.9%
+  --------------------------------------------------------------
+
+ HEADLINE FINDING — REROUTING BACKFIRES IN A DENSE WAREHOUSE
+   In the default 10-aisle warehouse (task2a) rerouting helped slightly
+   (+0.4% to +1.2%).  Here it actively HURTS, by 7-9% at 3 pickers and a
+   massive ~21% at 5 pickers.  Reason: with only two one-way aisles and most
+   picks inside them, there is nowhere useful to go when blocked.  The picker
+   defers the contested aisle, walks extra distance to the few remaining
+   tiles, then returns — and the queue is still there (everyone else deferred
+   and returned too).  Deferral adds travel without avoiding the wait.
+   CONCLUSION: opportunistic rerouting needs ALTERNATIVE WORK to be a win; its
+   value is non-monotonic in contention.  Low contention -> nothing to dodge;
+   moderate contention with many aisles -> small win; saturated contention
+   with few aisles -> active thrashing.  A production rule should check queue
+   depth AND remaining alternative tiles, not just wait time.
+
+
+--------------------------------------------------------------------------------
+ R4.  HEAVY-GOODS WAREHOUSE  weights -> uniform(200, 2000) post-generation
+--------------------------------------------------------------------------------
+ Relevance: weight-ordering (heavy->normal->fragile segmentation).
+ Same transactions both runs (seed=1); only the weight CLASSIFICATION changes.
+
+  --------------------------------------------------------------------
+   weights        | class mix                      | avg dist | fixes
+  --------------------------------------------------------------------
+   default        | heavy 53% / normal 43% / fr 3% | 194.2 m  | 0.20
+   heavy-goods    | heavy 81% / normal 19% / fr 0% | 195.5 m  | 0.56
+  --------------------------------------------------------------------
+
+ FINDINGS
+   * Raw-order weight violations nearly triple (0.20 -> 0.56 fixes/run): with
+     81/19 heavy/normal, a normal item slipping in front of a heavy one is a
+     violation far more often than under the default mix.
+   * Distance moves little (+0.7%): segment count per run changes only mildly.
+   * (Caveat: reassigning weights post-generation does not re-slot inventory;
+     locations keep their original weight_limit assignment.  Fine for the
+     ordering experiment, but slotting-dependent experiments would need the
+     weights changed inside generate().)
+
+
+--------------------------------------------------------------------------------
+ R5.  HIGHLY SKEWED DEMAND   Pareto shape 1.2 -> 0.5
+--------------------------------------------------------------------------------
+  --------------------------------------------------------
+   shape | top-5% SKUs share of picks | top-20% share
+  --------------------------------------------------------
+   1.2   |           47%              |      75%
+   0.5   |           96%              |      99%
+  --------------------------------------------------------
+
+ FINDING — RECIPE HAS NO ROUTING/DES EFFECT (generator limitation)
+   The shape change produces the intended demand profile (a 95/5 split).  BUT
+   the transaction generator draws pick items UNIFORMLY from inventory
+   (data_gen.py: rng.choice(item_arr) — no probability weights), ignoring
+   picks_30/60 entirely.  So demand skew changes the items TABLE but not which
+   items actually get picked — routing and DES results are untouched.
+   Natural extension: weight the rng.choice by picks_60 so fast movers
+   dominate transactions; then skew would concentrate traffic on the fast
+   movers' aisles and interact with slotting/contention.
+
+
+--------------------------------------------------------------------------------
+ R6.  MULTI-DAY DEMAND WITH TREND   generate(n_pickruns=2000, n_days=90, seed=7)
+--------------------------------------------------------------------------------
+  picks_trend over 300 SKUs: mean 0.39, median 0.40
+
+  --------------------------------------------------------------
+   thresholds            | accelerating | declining
+  --------------------------------------------------------------
+   README (>1.3 / <0.7)  |      3       |   273   <- misleading
+   rescaled (>0.65/<0.35)|     45       |   129
+  --------------------------------------------------------------
+
+ FINDING — README THRESHOLDS DON'T FIT THE RATIO'S CONSTRUCTION
+   picks_trend = picks_30 / picks_60, and picks_30 covers HALF the window of
+   picks_60 — so steady demand gives a ratio of ~0.5, not 1.0.  The README's
+   1.3 / 0.7 thresholds implicitly assume a normalised (rate-based) ratio and
+   classify 91% of SKUs as "declining".  Halving the thresholds (0.65 / 0.35)
+   gives sensible flags (45 accelerating / 129 declining).  Either rescale the
+   thresholds or redefine the column as (picks_30/30)/(picks_60/60).
+   Otherwise a data-profiling recipe — no routing/DES dimension (and per R5,
+   transactions are not demand-weighted anyway).
+
+
+--------------------------------------------------------------------------------
+ R7.  COLD-CHAIN HEAVY       80% of slots reassigned to CHILLER/FREEZER
+--------------------------------------------------------------------------------
+ Relevance: Task 4 — amplifies the cold-last constraint.
+
+ FINDING FIRST — THE README SNIPPET AS WRITTEN IS A NO-OP
+   The README reassigns ds.items["zone_type_1"].  But cold-last routing reads
+   zones from ds.LOCATIONS (the loc_zone lookup in route_pickrun), and
+   reassigning item zones after generation does not re-slot inventory.  So the
+   snippet changes nothing observable.  Applied to ds.locations instead
+   (same 80% / rng(3)/rng(4) construction):
+
+  --------------------------------------------------------------------
+   routing              | avg dist/run | avg ordering_fixes
+  --------------------------------------------------------------------
+   nn (no constraint)   |   190.2 m    |       0.08
+   nn cold-last         |   211.6 m    |       1.24   (+11.3% distance)
+  --------------------------------------------------------------------
+
+ FINDINGS
+   * With 80% of slots cold AND randomly interspersed, the constraint binds on
+     nearly every pick: violations jump from 0.08 (weight-only) to 1.24/run.
+   * The distance penalty is +11.3% — in line with task4b's interspersed
+     result (+10.6% at 70/20/10), and the opposite sign of the default grouped
+     layout (-2.2%).  Zone GROUPING, more than cold share, is what makes
+     cold-chain compliance cheap.
+
+
+--------------------------------------------------------------------------------
+ R8.  ZONE-CROSSING EXPERIMENTS
+--------------------------------------------------------------------------------
+ Already implemented as Task 4d: run_des(zone_lookup=..., zone_cross_penalty_s=s)
+ adds an env.timeout per consecutive-tile zone change and reports
+ n_zone_crossings.  Results in task4_cold-chain.txt (the 60 s penalty flips the
+ winning solver from 2opt to nn cold-last).
+
+
+================================================================================
+ CROSS-RECIPE TAKEAWAYS
+================================================================================
+   1. Regime first: sync releases (R1) or nothing else is measurable.
+   2. Solver gains scale with instance size: ACO goes from "ties 2opt" on the
+      default dataset to outright best on the large warehouse (R2).
+   3. Rerouting value is NON-MONOTONIC in contention: small win with many
+      alternative aisles, ~21% LOSS when saturated with few aisles (R3).
+   4. Three README artefacts found and documented:
+        - R5: transactions ignore the demand columns (uniform item draw)
+        - R6: picks_trend thresholds assume the wrong normalisation (~0.5 base)
+        - R7: the cold-chain-heavy snippet edits items, but routing reads
+          location zones — apply it to ds.locations
+   5. Zone grouping, not cold share, drives the cost of cold-chain compliance
+      (R7 vs task4b).
+
+================================================================================

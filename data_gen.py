@@ -54,6 +54,7 @@ def generate(
     max_lines_per_run: int = 8,
     n_days: int = 90,
     seed: int = 42,
+    random_zones: bool = False,
 ) -> Dataset:
     """Generate a synthetic warehouse dataset.
 
@@ -74,6 +75,13 @@ def generate(
         Days to spread pickruns over.
     seed
         Random seed for reproducibility.
+    random_zones
+        When False (default) zones are grouped by aisle (ambient aisles first,
+        then chiller, then freezer) — the realistic layout where cold zones are
+        physically clustered.  When True every location is assigned a zone
+        independently at random (same 70/20/10 split), so cold slots are
+        interspersed across all aisles.  Used by Task 4b to measure the cold-
+        last distance penalty when cold zones are NOT spatially grouped.
 
     Notes
     -----
@@ -113,21 +121,28 @@ def generate(
     n_ambient = max(1, int(n_aisles * 0.70))
     n_chiller = max(0, int(n_aisles * 0.20))
 
+    # When random_zones, draw a per-location zone up front (interspersed layout).
+    # Only consume rng in this branch so the default seed=42 stream is unchanged.
+    rand_zones = (rng.choice(ZONES, n_aisles * n_positions, p=ZONE_WEIGHTS)
+                  if random_zones else None)
+
     loc_ids, xs, ys, zones_l, modules = [], [], [], [], []
+    loc_idx = 0
     for aisle in range(1, n_aisles + 1):
         module = f"MOD_{chr(64 + (aisle - 1) % 26 + 1)}"
         if aisle <= n_ambient:
-            zone = "AMBIENT"
+            aisle_zone = "AMBIENT"
         elif aisle <= n_ambient + n_chiller:
-            zone = "CHILLER"
+            aisle_zone = "CHILLER"
         else:
-            zone = "FREEZER"
+            aisle_zone = "FREEZER"
         for pos in range(1, n_positions + 1):
             loc_ids.append(f"A{aisle:02d}P{pos:03d}")
             xs.append(aisle)
             ys.append(pos)
-            zones_l.append(zone)
+            zones_l.append(rand_zones[loc_idx] if random_zones else aisle_zone)
             modules.append(module)
+            loc_idx += 1
 
     n_locs = len(loc_ids)
     locations = pd.DataFrame({

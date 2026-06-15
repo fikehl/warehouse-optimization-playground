@@ -1,0 +1,204 @@
+================================================================================
+ TASK 4 — COLD-CHAIN CONSTRAINTS : RESULTS & IMPLEMENTATION REPORT
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ 0.  EXPERIMENT SETUP
+--------------------------------------------------------------------------------
+ Synthetic dataset (identical to run_demo.py):
+     generate(n_aisles=10, n_positions=20, n_items=300,
+              n_pickruns=500, n_days=1, seed=42)
+
+     - 200 locations (10 aisles x 20 positions)
+     - 500 pickruns, avg 4.8 items/run
+     - Zone layout (default): aisles grouped by temperature, ambient first.
+         AMBIENT  = aisles 1-7   (70%)
+         CHILLER  = aisles 8-9   (20%)
+         FREEZER  = aisle  10    (10%)
+     - cold_last=True forces AMBIENT -> CHILLER -> FREEZER pick ordering, on top
+       of the heavy -> normal -> fragile weight ordering (up to 9 segments).
+
+ Cold-chain background:
+     A "cold" item is one whose location zone is CHILLER or FREEZER. The point
+     of cold_last is to pick cold items as late as possible so they spend the
+     least time out of refrigeration sitting in the cart.
+
+ DES note (4c/4d): releases synchronised to t=0 (SYNC_RELEASES), as in
+ task2/task3 — otherwise makespan is release-bound and per-crossing penalties
+ are swamped by the 16 h release window.
+
+ Reproduce:
+     python task4_cold_chain.py        # 4a / 4b / 4c / 4d, all sections
+
+
+================================================================================
+ 4a.  HOW OFTEN DOES THE RAW ORDER VIOLATE COLD-CHAIN?
+================================================================================
+ Question : Compare the ordering_fixes column with and without cold_last. Each
+            EXTRA fix is a cold item the raw order would have picked before an
+            ambient/normal one.
+
+ ordering_fixes counts how many items arrive out of the enforced (zone, weight)
+ order in the raw transaction sequence:
+   - without cold_last : weight axis only (heavy->normal->fragile)
+   - with cold_last    : weight axis PLUS zone axis (ambient->chiller->freezer)
+ so the difference isolates pure cold-chain violations.
+
+ Run the SAME full solver comparison as run_demo.py [3/6] (200-pickrun sample)
+ and read the ordering_fixes column down the cold-last vs non-cold-last rows.
+
+ Results (avg ordering_fixes per pickrun, 200-pickrun sample, seed=42):
+
+  --------------------------------------------------------------------------
+   solver   | fixes (weight only) | fixes (+cold-chain) | extra (cold-chain)
+  --------------------------------------------------------------------------
+   nn       |        0.55         |        1.18         |      +0.62
+   2opt     |        0.55         |        1.18         |      +0.62
+   or_opt   |        0.55         |        1.18         |      +0.62
+   aisle_nn |        0.55         |        1.18         |      +0.62
+   bucketed |        0.55         |        1.18         |      +0.62
+   sa       |        0.55         |        1.18         |      +0.62
+   mst      |        0.55         |        1.18         |      +0.62
+   aco      |        0.55         |        1.18         |      +0.62
+  --------------------------------------------------------------------------
+   (over all 500 pickruns the numbers are 0.53 / 1.20 / +0.66.)
+
+ FINDINGS
+   * ordering_fixes is IDENTICAL for every solver. It is computed from the raw
+     transaction order BEFORE any solver runs (tsp.route_pickrun), so it is a
+     property of the input data, not of the route the solver builds. Running
+     all eight solvers makes this invariance explicit.
+   * The raw order commits ~0.62 cold-chain violations per pickrun on average —
+     i.e. in a meaningful fraction of orders a CHILLER/FREEZER item appears
+     before an ambient/normal item it should follow.
+   * Total weight+cold violations more than double (0.55 -> 1.18) once the cold
+     axis is enforced, confirming the raw picking sequence frequently ignores
+     temperature ordering. The segmented router then re-orders to satisfy it.
+
+
+================================================================================
+ 4b.  COST OF THE CONSTRAINT  (grouped vs interspersed cold zones)
+================================================================================
+ Change   : data_gen.generate() gained random_zones (default False). When True,
+            every location is assigned a zone independently at random (same
+            70/20/10 split) instead of by aisle, so cold slots are interspersed
+            across all aisles rather than clustered in one block.
+            (Only consumes rng in the True branch, so the default seed=42 stream
+            — and therefore every existing result — is unchanged.)
+
+ Question : enforcing cold-last often REDUCES distance when cold zones are
+            grouped (you stop backtracking into the cold block). Does it cost
+            distance when zones are interspersed?
+
+ Results (avg routed distance/run, solver=nn, seed=42):
+
+  --------------------------------------------------------------------------
+   layout                | base dist | cold-last dist | penalty vs base
+  --------------------------------------------------------------------------
+   grouped (default)     |  185.0 m  |    180.9 m     |    -2.2%
+   interspersed          |  189.6 m  |    209.8 m     |   +10.6%
+  --------------------------------------------------------------------------
+
+ FINDINGS
+   * Grouped layout: cold-last is actually CHEAPER (-2.2%). Because the cold
+     aisles are one contiguous block, picking them last clusters the route
+     spatially and removes backtracking into the cold area.
+   * Interspersed layout: cold-last costs +10.6%. With cold slots scattered
+     everywhere, forcing "all ambient, then all chiller, then all freezer"
+     makes the picker zig-zag across the whole warehouse three times.
+   * CONCLUSION: the cold-last constraint is close to free (often beneficial)
+     in a realistic zone-grouped warehouse, but carries a real distance penalty
+     in a poorly-slotted interspersed one. Slotting layout and the cold-chain
+     rule interact — good zone grouping makes compliance cheap.
+
+
+================================================================================
+ 4c.  DWELL-TIME MODEL IN THE DES
+================================================================================
+ Change   : run_des() gained zone_lookup ({tile: zone}). When supplied the DES
+            tracks, for every CHILLER/FREEZER pick, the "dwell time" = seconds
+            from when the cold item is picked until its pickrun finishes (it
+            rides in the cart that whole time). New return keys:
+               avg_cold_dwell_s, max_cold_dwell_s, total_cold_dwell_s,
+               n_cold_picks
+            Implemented in _do_route via a per-pickrun list of cold-pick
+            timestamps, differenced against the pickrun end time.
+
+ Why dwell beats ordering violations: even a perfectly ordered route keeps the
+ FIRST chiller item in the cart for the entire freezer segment, so dwell
+ measures actual exposure that an ordering-only check misses.
+
+ Results (3 pickers, synchronised releases, default grouped layout):
+
+  --------------------------------------------------------------------------
+   routes        | avg cold dwell | max cold dwell | cold picks
+  --------------------------------------------------------------------------
+   plain NN      |    104.3 s     |    338.7 s     |    678
+   cold-last NN  |     32.7 s     |    138.7 s     |    678
+  --------------------------------------------------------------------------
+
+ FINDINGS
+   * cold-last cuts average cold-item dwell by ~69% (104.3 s -> 32.7 s) and the
+     worst-case dwell by ~59% (338.7 s -> 138.7 s).
+   * Same number of cold picks (678) in both — the ordering, not the pick set,
+     changes. cold-last simply moves those picks to the end of each run so they
+     spend far less time warming in the cart.
+   * This quantifies the cold-chain benefit in TIME (refrigeration exposure),
+     which is the operationally meaningful metric, rather than just counting
+     ordering violations as in 4a.
+
+
+================================================================================
+ 4d.  ZONE-CROSSING PENALTY  (does it change which solver wins?)
+================================================================================
+ Change   : run_des(zone_cross_penalty_s=s) adds env.timeout(s) whenever two
+            consecutive PICKED tiles belong to different zones (handling/door
+            overhead between temperature areas). Requires zone_lookup. New
+            return key n_zone_crossings counts the penalised transitions.
+
+ Question : does the penalty change which routing wins?
+
+ Results (3 pickers, 60 s per zone crossing, synchronised releases):
+
+  --------------------------------------------------------------------------
+   routing        | makespan (no penalty) | makespan (+penalty) | crossings
+  --------------------------------------------------------------------------
+   nn             |       419.6 min       |      697.0 min      |    766
+   2opt           |       401.3 min       |      660.2 min      |    733
+   aisle_nn       |       428.8 min       |      651.8 min      |    653
+   nn cold-last   |       412.6 min       |      572.7 min      |    472
+  --------------------------------------------------------------------------
+
+ FINDINGS
+   * YES — the winner flips. With no penalty, plain 2opt wins on makespan
+     (401.3 min) and cold-last is only mid-pack (412.6 min).
+   * With a steep 60 s per-crossing penalty, nn cold-last wins decisively
+     (572.7 min) — it crosses the fewest zone boundaries (472 vs 733 for 2opt)
+     because it groups all picks by zone, so it pays the least penalty.
+   * aisle_nn (S-shape sweep) also climbs the ranking (653 crossings) for the
+     same reason — sweeping by aisle column keeps same-zone tiles together.
+   * CONCLUSION: when crossing temperature boundaries is expensive, the solver
+     that minimises raw walking distance is NOT the best choice; a zone-aware
+     ordering (cold_last / aisle sweep) wins by minimising crossings. The right
+     objective depends on whether distance or zone-crossing dominates the cost.
+
+
+================================================================================
+ IMPLEMENTATION SUMMARY (where to look in the code)
+================================================================================
+   data_gen.py
+     - generate(..., random_zones=False)   — interspersed-zone layout (4b)
+
+   des.py
+     - run_des() new params: zone_lookup, zone_cross_penalty_s
+     - _do_route(): _arrive() helper applies the cross-zone penalty (4d) and
+       records cold-pick timestamps; dwell computed at pickrun end (4c)
+     - new return keys: avg/max/total_cold_dwell_s, n_cold_picks,
+       n_zone_crossings
+
+   task4_cold_chain.py                     — runs all four sub-tasks (4a-4d)
+
+ To reproduce:
+     python task4_cold_chain.py
+================================================================================
